@@ -25,10 +25,11 @@ import numpy as np
 # 导入项目模块
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
 from models.vae.heightmap_vae import HeightMapVAE
-from data.height_dataset import HeightMapDataset
+from dataset.height_map_dataset import HeightMapDataset
 
 
 # =============================================================================
