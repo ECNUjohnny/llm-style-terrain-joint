@@ -35,21 +35,20 @@ class HeightMapVAE(AutoencoderKL):
                 "DownEncoderBlock2D",
                 "DownEncoderBlock2D",
                 "DownEncoderBlock2D",
-                "DownEncoderBlock2D",
             ],
             up_block_types=[
                 "UpDecoderBlock2D",
                 "UpDecoderBlock2D",
                 "UpDecoderBlock2D",
-                "UpDecoderBlock2D",
             ],
-            block_out_channels=(64, 128, 256, 512),
+            block_out_channels=(128, 256, 512),
             layers_per_block=2,
             act_fn="silu",
             # 焊死 4 通道，与纹理 VAE 对齐
             latent_channels=4,
             sample_size=512,
-            scaling_factor=0.18215,
+            # scaling_factor=0.18215,
+            scaling_factor=1.0,
         )
 
     @staticmethod
