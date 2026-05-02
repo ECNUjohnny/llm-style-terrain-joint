@@ -12,3 +12,6 @@ wheels/
 # Cache
 .kilo
 .ruff_cache
+
+# Outputs
+outputs
