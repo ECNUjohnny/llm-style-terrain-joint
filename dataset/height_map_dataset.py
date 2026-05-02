@@ -23,7 +23,7 @@ class HeightMapDataset(Dataset):
 
     def __init__(
         self,
-        data_root: str = "data/process/heightmaps",
+        data_root: str = "data/process/heightmaps_hf",
         image_size: int = 512,
         augment: bool = False,
         hflip_prob: float = 0.5,

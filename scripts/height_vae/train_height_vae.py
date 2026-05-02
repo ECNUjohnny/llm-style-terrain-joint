@@ -37,7 +37,7 @@ from dataset.height_map_dataset import HeightMapDataset
 # =============================================================================
 
 # 数据配置
-DATA_ROOT = "./data/height_maps"
+DATA_ROOT = "./data/process/heightmaps_hf"
 IMAGE_SIZE = 512
 BATCH_SIZE = 8
 NUM_WORKERS = 4
