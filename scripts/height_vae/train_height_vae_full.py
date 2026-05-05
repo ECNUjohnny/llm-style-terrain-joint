@@ -1,33 +1,48 @@
 """
-高度图 VAE 训练脚本（显存优化版）
+高度图 VAE 训练脚本（效果优先版）
 
 Phase 3: 训练高度图专用 VAE
-目标：解决高程数据压缩失真的问题，确保陡崖边缘清晰
+目标：追求最佳重建质量，不优先考虑显存和训练速度约束
 
-=== 显存估算 (fp32, BATCH_SIZE=1, grad_checkpointing=ON) ===
-  模型参数: 55.32M (encoder 22.36M + decoder 32.96M)
-  模型权重:  221 MB
-  优化器:    442 MB (AdamW fp32, momentum + variance)
-  梯度:      221 MB
-  激活值:   ~430 MB (检查点边界张量, 最大 128MB@[1,128,512,512])
-            + ~350 MB (单块重计算峰值, grad_checkpointing 下逐块重算)
+=== 显存估算 (AMP fp16, BATCH_SIZE=2, grad_checkpointing=OFF) ===
+  模型参数: 73.14M (encoder 24.72M + decoder 48.42M)
+  模型权重:  293 MB (fp32 master) + 临时 fp16 副本
+  优化器:    585 MB (AdamW fp32, momentum + variance)
+  梯度:      146 MB (fp16)
+  激活值:   ~3-5 GB (全激活值驻留, 最大 64MB@[2,128,512,512] fp16)
+            (4 层 block, 无梯度检查点, 所有中间激活值存入计算图)
   CUDA开销:  ~500-1000 MB (cuDNN workspace + PyTorch context)
   ─────────────────────
-  总计:     ~2.5-3.5 GB  (8 GB 显卡充裕, 4 GB 勉强可跑)
+  总计:     ~6-10 GB  (16 GB 显卡充裕, 12 GB 可跑)
 
 === 关键参数设计原则 ===
-  - BATCH_SIZE=1 + gradient_accumulation_steps=8 → 模拟有效 batch=8
-  - block_out_channels=(128,256,512) → 3 层, 55M 参数
-  - enable_grad_checkpointing=True → 省 50%+ 激活值显存, 零精度损失
-  - USE_AMP=False → fp32 运行 (与 grad_checkpointing 冲突)
-  - 目标显卡: 6-8 GB VRAM
+  - BATCH_SIZE=2 → 真实 batch, 更稳定的梯度估计, 无累积偏差
+  - block_out_channels=(128,256,512,512) → 4 层, 73M 参数 (对齐 SD VAE 容量)
+  - enable_grad_checkpointing=False → 完整保留全局计算图, 梯度流更精确
+  - USE_AMP=True → 混合精度 fp16 加速 2-3×, 激活值显存减半
+  - gradient_accumulation_steps=1 → 不做梯度累积, 每步即时更新
+  - USE_HUBER_LOSS=True → SmoothL1 对高程跳变更鲁棒
+  - 目标显卡: 16-24 GB VRAM (A5000/3090/4090)
+
+=== 与显存优化版 (train_height_vae.py) 的主要区别 ===
+  参数                      |  显存优化版          |  效果优先版
+  ──────────────────────────┼─────────────────────┼─────────────────────────
+  BATCH_SIZE                |  1 (+ acc=8 模拟=8)  |  2 (真实 batch)
+  BLOCK_OUT_CHANNELS        |  (128, 256, 512)     |  (128, 256, 512, 512)
+  参数量                     |  55.32M              |  73.14M (+32%)
+  ENABLE_GRAD_CHECKPOINTING  |  True                |  False
+  USE_AMP                   |  False (fp32)         |  True (fp16)
+  GRADIENT_ACCUMULATION_STEPS|  8                   |  1
+  NUM_WORKERS               |  4                   |  8
+  USE_HUBER_LOSS            |  False               |  True
+  预估显存                   |  ~2.5-3.5 GB         |  ~6-10 GB
 
 用法：
     # 训练
-    python scripts/height_vae/train_height_vae.py --data_root ./data/height_maps --epochs 100
+    python scripts/height_vae/train_height_vae_full.py --epochs 100
 
     # 测试重建质量
-    python scripts/height_vae/train_height_vae.py --mode test --checkpoint ./outputs/height_vae/checkpoint.pt
+    python scripts/height_vae/train_height_vae_full.py --mode test --checkpoint ./outputs/height_vae_full/checkpoint.pt
 """
 
 import argparse
@@ -56,19 +71,19 @@ from dataset.height_map_dataset import HeightMapDataset
 
 
 # =============================================================================
-# 训练配置（硬编码）
+# 训练配置（硬编码 — 效果优先）
 # =============================================================================
 
 # 数据配置
 DATA_ROOT = "./data/process/heightmaps_hf"
 IMAGE_SIZE = 512
-BATCH_SIZE = 1  # 显存充足时可调至 2-8
-NUM_WORKERS = 4
+BATCH_SIZE = 2  # 真实 batch，不做累积偏差
+NUM_WORKERS = 8  # 更快的 I/O
 
 # 模型配置
 H_MAX = 3000.0  # 全局最大高程（仅用于 raw-elevation 场景，log 归一化数据不使用）
-BLOCK_OUT_CHANNELS = (128, 256, 512)  # 显存不足时可降为 (64, 128, 256)
-ENABLE_GRAD_CHECKPOINTING = True  # 零精度损失，节省 ~50% 显存；不能与 AMP 同时开启
+BLOCK_OUT_CHANNELS = (128, 256, 512, 512)  # 4 层 block，对齐 SD VAE 容量
+ENABLE_GRAD_CHECKPOINTING = False  # 完整计算图，梯度流不截断
 
 # 优化器配置
 LEARNING_RATE = 1e-4
@@ -80,21 +95,21 @@ ADAM_BETA2 = 0.999
 NUM_EPOCHS = 100
 WARMUP_EPOCHS = 5
 GRAD_CLIP = 1.0
-GRADIENT_ACCUMULATION_STEPS = 8  # 模拟有效 batch=8，显存充足时可调至 1-4
-USE_AMP = False  # 混合精度（fp16）会与梯度检查点冲突；禁用后以 fp32 运行
+GRADIENT_ACCUMULATION_STEPS = 1  # 不做梯度累积
+USE_AMP = True  # 混合精度 fp16 加速
 
 # 损失权重
 LOSS_WEIGHT_MSE = 1.0
 LOSS_WEIGHT_KL = 1e-6
 LOSS_WEIGHT_GEO = 0.8
 KL_ANNEALING_EPOCHS = 5  # KL 权重从 0 线性增长到目标值的 epoch 数，0 禁用
-USE_HUBER_LOSS = False  # SmoothL1 对高程跳变更鲁棒，beta 在计算时动态设为 0.01
+USE_HUBER_LOSS = True  # SmoothL1 对高程跳变更鲁棒
 
 # 设备配置
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 输出配置
-OUTPUT_DIR = "./outputs/height_vae"
+OUTPUT_DIR = "./outputs/height_vae_full"
 CHECKPOINT_STEPS = 1000
 LOG_STEPS = 10
 VIZ_INTERVAL = 1  # 每隔 N 个 epoch 生成一张效果图
@@ -102,7 +117,7 @@ VIZ_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "visualizations")
 
 
 class Trainer:
-    """高度图 VAE 训练器"""
+    """高度图 VAE 训练器（支持 AMP 混合精度）"""
 
     def __init__(
         self,
@@ -113,6 +128,7 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         kl_annealing_epochs: int = 0,
         use_huber_loss: bool = False,
+        use_amp: bool = False,
     ):
         """
         初始化训练器
@@ -125,6 +141,7 @@ class Trainer:
             gradient_accumulation_steps: 梯度累积步数
             kl_annealing_epochs: KL 退火 epoch 数
             use_huber_loss: 是否用 SmoothL1 替代 MSE
+            use_amp: 是否使用混合精度 (torch.cuda.amp)
         """
         self.vae = vae.to(device)
         self.dataloader = dataloader
@@ -133,6 +150,10 @@ class Trainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.kl_annealing_epochs = kl_annealing_epochs
         self.use_huber_loss = use_huber_loss
+        self.use_amp = use_amp
+
+        # AMP GradScaler（仅当 use_amp=True 且设备为 cuda 时）
+        self.scaler = torch.amp.GradScaler("cuda") if use_amp and device == "cuda" else None
 
         # 创建输出目录
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -196,23 +217,34 @@ class Trainer:
             # 数据移到设备
             height_maps = height_maps.to(self.device)
 
-            # 前向传播
-            recon, loss_dict = self.vae(height_maps, return_recon_only=False)
-            loss_recon = F.smooth_l1_loss(recon, height_maps, beta=0.01) if self.use_huber_loss else loss_dict["loss_mse"]
-            loss_kl = loss_dict["loss_kl"]
-            loss_geo = loss_dict["loss_geo"]
-            loss_total = LOSS_WEIGHT_MSE * loss_recon + kl_weight * loss_kl + LOSS_WEIGHT_GEO * loss_geo
+            # AMP autocast 上下文
+            with torch.autocast(device_type="cuda", enabled=self.use_amp):
+                # 前向传播
+                recon, loss_dict = self.vae(height_maps, return_recon_only=False)
+                loss_recon = F.smooth_l1_loss(recon, height_maps, beta=0.01) if self.use_huber_loss else loss_dict["loss_mse"]
+                loss_kl = loss_dict["loss_kl"]
+                loss_geo = loss_dict["loss_geo"]
+                loss_total = LOSS_WEIGHT_MSE * loss_recon + kl_weight * loss_kl + LOSS_WEIGHT_GEO * loss_geo
 
             # 梯度累积
             loss_total = loss_total / self.gradient_accumulation_steps
 
-            # 反向传播
-            loss_total.backward()
+            # 反向传播（AMP 通过 scaler 缩放）
+            if self.scaler is not None:
+                self.scaler.scale(loss_total).backward()
+            else:
+                loss_total.backward()
 
             # 每 accumulation_steps 步更新一次权重
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(self.vae.parameters(), GRAD_CLIP)
-                self.optimizer.step()
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.vae.parameters(), GRAD_CLIP)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.vae.parameters(), GRAD_CLIP)
+                    self.optimizer.step()
                 self.optimizer.zero_grad()
 
             # 更新统计
@@ -277,7 +309,7 @@ class Trainer:
 
         # ---- 绘图 ----
         fig = plt.figure(figsize=(16, 12))
-        fig.suptitle(f"HeightMapVAE Training — Epoch {epoch}", fontsize=14, fontweight="bold")
+        fig.suptitle(f"HeightMapVAE Full Training — Epoch {epoch}", fontsize=14, fontweight="bold")
 
         # 第 1 行：4 个 Loss 曲线（1×4）
         ax1 = fig.add_subplot(3, 4, 1)
@@ -361,10 +393,16 @@ class Trainer:
         print(f"设备：{self.device}")
         print(f"批次大小：{BATCH_SIZE}" + (f" (有效: {BATCH_SIZE * self.gradient_accumulation_steps})" if self.gradient_accumulation_steps > 1 else ""))
         print(f"学习率：{LEARNING_RATE}")
+        print(f"混合精度 (AMP)：{'开启' if self.use_amp else '关闭'}")
         print(f"梯度累积步数：{self.gradient_accumulation_steps}")
+        print(f"模型层数：{len(BLOCK_OUT_CHANNELS)} (channels: {BLOCK_OUT_CHANNELS})")
         print(
             f"损失权重：MSE={LOSS_WEIGHT_MSE}, KL={LOSS_WEIGHT_KL}, GEO={LOSS_WEIGHT_GEO}"
         )
+        if self.use_huber_loss:
+            print("损失函数：SmoothL1 (Huber)")
+        else:
+            print("损失函数：MSE")
         if self.kl_annealing_epochs > 0:
             print(f"KL 退火：{self.kl_annealing_epochs} epochs 内从 0 线性增长")
         print("-" * 60)
@@ -389,6 +427,7 @@ class Trainer:
                     f"Geo: {loss_dict['loss_geo']:.4f} | "
                     f"LR: {current_lr:.6f}"
                     + (f" | KL_w: {self.get_kl_weight(epoch):.2e}" if self.kl_annealing_epochs > 0 else "")
+                    + (f" | Scale: {self.scaler.get_scale():.0f}" if self.scaler is not None else "")
                 )
 
             # 保存最佳模型
@@ -436,6 +475,8 @@ class Trainer:
             "best_loss": self.best_loss,
             "loss_history": self.loss_history,
         }
+        if self.scaler is not None:
+            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
         # 保存文件名
         if is_final:
@@ -468,6 +509,8 @@ class Trainer:
         self.best_loss = checkpoint["best_loss"]
         if "loss_history" in checkpoint:
             self.loss_history = checkpoint["loss_history"]
+        if "scaler_state_dict" in checkpoint and self.scaler is not None:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
         print(f"加载检查点：{checkpoint_path}")
         print(f"  Epoch: {checkpoint['epoch']}")
@@ -583,7 +626,7 @@ def test_reconstruction(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="高度图 VAE 训练")
+    parser = argparse.ArgumentParser(description="高度图 VAE 训练（效果优先版）")
 
     parser.add_argument(
         "--mode",
@@ -639,7 +682,7 @@ def main():
 
     if args.mode == "train":
         # ==================== 训练模式 ====================
-        print("=== 高度图 VAE 训练 ===")
+        print("=== 高度图 VAE 训练（效果优先版） ===")
 
         # 创建数据加载器
         dataloader = DataLoader(
@@ -655,13 +698,13 @@ def main():
             drop_last=True,
         )
 
-        # 创建模型（支持梯度检查点）
+        # 创建模型（不使用梯度检查点，保留完整计算图）
         vae = HeightMapVAE(
             block_out_channels=BLOCK_OUT_CHANNELS,
             enable_grad_checkpointing=ENABLE_GRAD_CHECKPOINTING,
         )
 
-        # 创建训练器
+        # 创建训练器（启用 AMP）
         trainer = Trainer(
             vae=vae,
             dataloader=dataloader,
@@ -670,6 +713,7 @@ def main():
             gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
             kl_annealing_epochs=KL_ANNEALING_EPOCHS,
             use_huber_loss=USE_HUBER_LOSS,
+            use_amp=USE_AMP,
         )
 
         # 恢复训练（如果有检查点）
@@ -687,8 +731,8 @@ def main():
             print("错误：测试模式需要指定 --checkpoint 参数")
             return
 
-        # 创建模型
-        vae = HeightMapVAE()
+        # 创建模型（与训练时一致的 block_out_channels）
+        vae = HeightMapVAE(block_out_channels=BLOCK_OUT_CHANNELS)
 
         # 加载检查点
         checkpoint = torch.load(args.checkpoint, map_location=DEVICE)
