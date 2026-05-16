@@ -27,9 +27,8 @@ import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-# === 白嫖的开源组件 ===
+# === 开源组件 ===
 from diffusers import DDPMScheduler, AutoencoderKL
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from diffusers import logging as diffusers_logging
 from transformers import logging as transformers_logging
@@ -40,13 +39,14 @@ transformers_logging.set_verbosity_error()
 from dataset.unet_dataset import UNetDataset
 from models.unet.unet_8ch import build_unet
 from models.vae.heightmap_vae import HeightMapVAE
+from models.clip.text_encoder import build_text_encoder
 
 # =============================================================================
 # 训练配置（软编码区：像仪表盘一样统一管理参数）
 # =============================================================================
 
 DATA_ROOT = "./data/unet_training"  # 你的数据集根目录
-DEM_VAE_CKPT = ""                   # 高程 VAE 权重路径 (为空则临时用 RGB_VAE 代替)
+DEM_VAE_CKPT = "./data/vae_model_data/best_checkpoint" # 高程 VAE 权重路径 (为空则临时用 RGB_VAE 代替)
 OUTPUT_DIR = "./outputs/unet_8ch"   # 模型和图片输出的根目录
 
 EPOCHS = 50
@@ -56,7 +56,7 @@ WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 USE_AMP = True                      # 是否开启 fp16 混合精度加速
 
-SAVE_STEPS = 1000                   # 每隔多少步保存一次常规快照
+SAVE_STEPS = 4000                   # 每隔多少步保存一次常规快照
 LOG_STEPS = 10                      # 每隔多少步在控制台打印一次日志
 VIZ_INTERVAL = 1                    # 每隔几个 epoch 画一次 Loss 曲线图
 
@@ -94,11 +94,8 @@ class UNetTrainer:
         # 2. 挂载黑盒翻译官 (CLIP)
         # ==========================================
         print("正在加载 CLIP 文本编码器...")
-        model_id = "openai/clip-vit-large-patch14"
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_id)
-        self.text_encoder = CLIPTextModel.from_pretrained(model_id).to(self.device)
+        self.text_encoder = build_text_encoder(model_name="openai/clip-vit-large-patch14").to(self.device)
         self.text_encoder.eval()
-        self.text_encoder.requires_grad_(False)
 
         # ==========================================
         # 3. 挂载空间压缩器 (两个 VAE)
@@ -138,10 +135,13 @@ class UNetTrainer:
 
     def encode_to_latent(self, rgb_pixels, dem_pixels):
         """核心魔法：把 512x512 的像素变成 64x64 的隐向量"""
+
         rgb_latent = self.rgb_vae.encode(rgb_pixels).latent_dist.sample() * 0.18215
         
+        # 这个地方的0.993099是用get_sigma脚本计算出来的
         if self.dem_vae is not None:
-            dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample() * 0.18215
+            dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample() * 0.993099
+        
         else:
             # 临时脚手架：强行把单通道 DEM 变 3 通道喂给 RGB VAE
             dem_pixels_3ch = dem_pixels.repeat(1, 3, 1, 1)
@@ -169,14 +169,8 @@ class UNetTrainer:
 
             with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
                 with torch.no_grad():
-                    text_inputs = self.tokenizer(
-                        prompts, padding="max_length", max_length=self.tokenizer.model_max_length, 
-                        truncation=True, return_tensors="pt"
-                    ).to(self.device)
-
-                    clip_output = self.text_encoder(text_inputs.input_ids)
-                    encoder_hidden_states = clip_output[0]
-                    pooled_features = clip_output[1]
+                    
+                    global_features, local_features = self.text_encoder(prompts)
 
                     latents = self.encode_to_latent(rgb_pixels, dem_pixels)
 
@@ -187,8 +181,8 @@ class UNetTrainer:
                 noise_pred = self.unet(
                     noisy_latent=noisy_latents,
                     timestep=timesteps,
-                    local_features=encoder_hidden_states,
-                    global_features=pooled_features,
+                    local_features=local_features,
+                    global_features=global_features,
                 )
                 
                 loss_dict = self.unet.loss(noise_pred, noise)
@@ -291,7 +285,7 @@ class UNetTrainer:
                 f"Dem Loss: {avg_loss['dem']:.4f}"
             )
             
-            # ⚠️ 拦截并保存最佳模型
+            # 拦截并保存最佳模型
             if avg_loss["loss"] < self.best_loss:
                 print(f"🌟 发现新的最佳 Loss ({self.best_loss:.4f} -> {avg_loss['loss']:.4f})，正在保存...")
                 self.best_loss = avg_loss["loss"]

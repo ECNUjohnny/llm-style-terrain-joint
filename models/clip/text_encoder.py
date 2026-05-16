@@ -1,51 +1,49 @@
 """
 双分支 CLIP 文本编码器
-
-根据 roadmap 描述：
-- Prompt 进入双分支 CLIP
-- 输出：全局特征向量 和 细节特征向量
 """
 
 import torch
 import torch.nn as nn
-from typing import Tuple, List, Optional
-
+from typing import Tuple, List
+# 引入 Hugging Face 的分词器和 CLIP 文本模型
+from transformers import CLIPTokenizer, CLIPTextModel
 
 class DualBranchCLIPEncoder(nn.Module):
     """
     双分支 CLIP 文本编码器
 
     将文本 Prompt 编码为两种特征：
-    1. 全局特征向量：捕捉整体语义（如"广东丹霞地貌"）
-    2. 细节特征向量：捕捉局部细节（如"红色平顶方山"）
+    1. 全局特征向量：捕捉整体语义
+    2. 细节特征向量：捕捉局部细节
     """
 
     def __init__(
         self,
-        model_name: str = "openai/clip-vit-base-patch32",
-        global_dim: int = 512,
-        local_dim: int = 512,
+        model_name: str = "openai/clip-vit-large-patch14",
+        global_dim: int = 768,
+        local_dim: int = 768,
     ):
         """
         初始化双分支 CLIP 编码器
-
-        Args:
-            model_name: CLIP 模型名称
-            global_dim: 全局特征维度
-            local_dim: 细节特征维度
         """
         super().__init__()
 
-        # TODO: 加载预训练 CLIP 模型
-        # self.clip_model = CLIPEncoder.from_pretrained(model_name)
+        # 1. 加载预训练的 Tokenizer 和 CLIP 模型
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
+        self.clip_model = CLIPTextModel.from_pretrained(model_name)
 
-        # 全局特征投影层
-        # 将 CLIP 的 [CLS] token 投影到全局特征空间
-        self.global_proj = nn.Linear(512, global_dim)
+        # 关键点：冻结 CLIP 模型的参数，防止在训练 UNet 时更新它，节省大量显存
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
 
-        # 细节特征投影层
-        # 将所有 token 序列投影到细节特征空间
-        self.local_proj = nn.Linear(512, local_dim)
+        # 获取 CLIP 模型默认的隐藏层维度（base 通常是 512，large 通常是 768）
+        hidden_size = self.clip_model.config.hidden_size
+
+        # 2. 全局特征投影层
+        self.global_proj = nn.Linear(hidden_size, global_dim)
+
+        # 3. 细节特征投影层
+        self.local_proj = nn.Linear(hidden_size, local_dim)
 
     def forward(
         self,
@@ -60,30 +58,34 @@ class DualBranchCLIPEncoder(nn.Module):
             global_features: 全局特征向量 [B, global_dim]
             local_features: 细节特征向量 [B, N, local_dim]
         """
-        # TODO: 实现 CLIP 文本编码
+        
+        # 1. 获取当前模型所在的设备 (GPU/CPU)
+        device = self.clip_model.device
 
-        # 伪代码示意：
-        # 1. 使用 CLIP tokenizer 对 prompts 进行分词
-        # text_inputs = self.tokenizer(
-        #     prompts,
-        #     padding="max_length",
-        #     truncation=True,
-        #     max_length=77,
-        #     return_tensors="pt",
-        # )
-        #
-        # 2. CLIP 文本编码器前向传播
-        # outputs = self.clip_model(**text_inputs)
-        #
-        # 3. 提取全局特征（[CLS] token 或 pooled output）
-        # global_features = outputs.pooler_output  # [B, 512]
-        # global_features = self.global_proj(global_features)  # [B, global_dim]
-        #
-        # 4. 提取细节特征（所有 token 的 hidden states）
-        # local_features = outputs.last_hidden_state  # [B, N, 512]
-        # local_features = self.local_proj(local_features)  # [B, N, local_dim]
+        # 2. 分词：将文本字符串变成模型能看懂的 Token ID
+        text_inputs = self.tokenizer(
+            prompts,
+            padding="max_length",
+            truncation=True,
+            max_length=77, # CLIP 的标准最大长度
+            return_tensors="pt",
+        ).to(device)       # 确保数据和模型在同一个显卡上
 
-        raise NotImplementedError("CLIP 文本编码功能待实现")
+        # 3. 送入 CLIP 提取特征（使用 torch.no_grad() 进一步确保不计算梯度）
+        with torch.no_grad():
+            outputs = self.clip_model(**text_inputs)
+
+        # 4. 提取并映射【全局特征】
+        # pooler_output 通常是句子结尾符 [EOS] 经过特定映射后的结果，代表全句语义
+        global_features = outputs.pooler_output  # 形状: [B, hidden_size]
+        global_features = self.global_proj(global_features)  # 形状: [B, global_dim]
+
+        # 5. 提取并映射【细节特征】
+        # last_hidden_state 包含了输入句子中所有 77 个 Token 的独立特征
+        local_features = outputs.last_hidden_state  # 形状: [B, 77, hidden_size]
+        local_features = self.local_proj(local_features)  # 形状: [B, 77, local_dim]
+
+        return global_features, local_features
 
 
 def build_text_encoder(
@@ -91,10 +93,5 @@ def build_text_encoder(
 ) -> DualBranchCLIPEncoder:
     """
     构建文本编码器工厂函数
-
-    Args:
-        model_name: CLIP 模型名称
-    Returns:
-        text_encoder: 双分支 CLIP 编码器
     """
     return DualBranchCLIPEncoder(model_name=model_name)
