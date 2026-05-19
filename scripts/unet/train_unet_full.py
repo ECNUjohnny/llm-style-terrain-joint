@@ -1,8 +1,12 @@
 """
-8通道 U-Net 训练脚本（规范化与可视化版）
+8通道 U-Net 训练脚本
 
 用法：
-    python train_unet_full.py
+    # 正常全新训练
+    python ./scripts/unet/train_unet_full.py --epoch 3
+    
+    # 自动寻找最新断点继续训练
+    python ./scripts/unet/train_unet_full.py --resume True
 """
 
 import os
@@ -46,7 +50,7 @@ from models.clip.text_encoder import build_text_encoder
 # =============================================================================
 
 DATA_ROOT = "./data/unet_training"  # 你的数据集根目录
-DEM_VAE_CKPT = "./data/vae_model_data/best_checkpoint" # 高程 VAE 权重路径 (为空则临时用 RGB_VAE 代替)
+DEM_VAE_CKPT = "./data/vae_model_data/best_checkpoint.pt" # 高程 VAE 权重路径 (为空则临时用 RGB_VAE 代替)
 OUTPUT_DIR = "./outputs/unet_8ch"   # 模型和图片输出的根目录
 
 EPOCHS = 50
@@ -56,9 +60,10 @@ WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 USE_AMP = True                      # 是否开启 fp16 混合精度加速
 
-SAVE_STEPS = 4000                   # 每隔多少步保存一次常规快照
+SAVE_STEPS = 12000                   # 每隔多少步保存一次常规快照
 LOG_STEPS = 10                      # 每隔多少步在控制台打印一次日志
 VIZ_INTERVAL = 1                    # 每隔几个 epoch 画一次 Loss 曲线图
+RESUME = False                      # 默认不自动开启续训，防止覆盖意图
 
 
 class UNetTrainer:
@@ -72,24 +77,48 @@ class UNetTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.viz_output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 用于记录画图的数据
-        self.loss_history = []  # 格式: [(epoch, total_loss, img_loss, dem_loss), ...]
+        # 用于记录画图的数据与进度
+        self.loss_history = []  
         self.global_step = 0
-        
-        # 新增：记录最佳 Loss 的变量
+        self.start_epoch = 0           # 新增：记录起始 Epoch
         self.best_loss = float("inf")
 
         # ==========================================
         # 1. 组建做题家 (U-Net) 与优化器
         # ==========================================
         print("正在组装 8 通道 U-Net...")
-        self.unet = build_unet(in_channels=8, out_channels=8, cross_attention_dim=768).to(self.device)
+        self.unet = build_unet(in_channels=8, out_channels=8).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.unet.parameters(), 
             lr=args.learning_rate, 
             weight_decay=WEIGHT_DECAY
         )
-        
+        self.scaler = torch.amp.GradScaler("cuda") if args.use_amp else None
+
+        # ==========================================
+        # 1.5 核心逻辑：断点恢复 (Checkpoint Loading)
+        # ==========================================
+        if self.args.resume:
+            ckpt_path = self.output_dir / "latest_checkpoint.pt"
+            if ckpt_path.exists():
+                print(f"\n发现断点文件: {ckpt_path}")
+                print("正在恢复模型、优化器及训练状态...")
+                checkpoint = torch.load(ckpt_path, map_location=self.device)
+                
+                self.unet.load_state_dict(checkpoint["model_state_dict"])
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if self.scaler is not None and "scaler_state_dict" in checkpoint:
+                    self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                
+                self.start_epoch = checkpoint["epoch"] + 1 # 从下一个 epoch 开始
+                self.global_step = checkpoint["global_step"]
+                self.best_loss = checkpoint.get("best_loss", float("inf"))
+                self.loss_history = checkpoint.get("loss_history", [])
+                
+                print(f"成功恢复！将从 Epoch {self.start_epoch} 继续训练，当前历史最佳 Loss: {self.best_loss:.4f}\n")
+            else:
+                print(f"\n未找到断点文件 ({ckpt_path})，将从头开始训练。\n")
+
         # ==========================================
         # 2. 挂载黑盒翻译官 (CLIP)
         # ==========================================
@@ -105,7 +134,6 @@ class UNetTrainer:
         self.rgb_vae.eval()
         self.rgb_vae.requires_grad_(False)
 
-        # 临时脚手架：如果没传 DEM VAE，就暂时不加载，交由 encode_to_latent 处理
         if args.dem_vae_ckpt:
             print("正在加载 高程图专属 VAE...")
             self.dem_vae = HeightMapVAE(block_out_channels=(128, 256, 512, 512)).to(self.device)
@@ -123,27 +151,22 @@ class UNetTrainer:
 
         dataset = UNetDataset(data_root=args.data_root, augment=True)
         self.dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-
-        self.scaler = torch.amp.GradScaler("cuda") if args.use_amp else None
         
         val_batch = next(iter(self.dataloader))
+        self.val_prompt = val_batch["prompt"][:1]
+
         self.val_rgb = val_batch["rgb"][:1].to(self.device)
         self.val_dem = val_batch["dem"][:1].to(self.device)
-        self.val_prompt = val_batch["prompt"][:1]
-        
+
         print(f"验证样本准备就绪，提示词: {self.val_prompt[0]}")
 
     def encode_to_latent(self, rgb_pixels, dem_pixels):
         """核心魔法：把 512x512 的像素变成 64x64 的隐向量"""
-
         rgb_latent = self.rgb_vae.encode(rgb_pixels).latent_dist.sample() * 0.18215
         
-        # 这个地方的0.993099是用get_sigma脚本计算出来的
         if self.dem_vae is not None:
             dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample() * 0.993099
-        
         else:
-            # 临时脚手架：强行把单通道 DEM 变 3 通道喂给 RGB VAE
             dem_pixels_3ch = dem_pixels.repeat(1, 3, 1, 1)
             dem_latent = self.rgb_vae.encode(dem_pixels_3ch).latent_dist.sample() * 0.18215
             
@@ -169,9 +192,7 @@ class UNetTrainer:
 
             with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
                 with torch.no_grad():
-                    
                     global_features, local_features = self.text_encoder(prompts)
-
                     latents = self.encode_to_latent(rgb_pixels, dem_pixels)
 
                 noise = torch.randn_like(latents)
@@ -214,12 +235,6 @@ class UNetTrainer:
                 "Dem": f"{total_dem_loss/num_batches:.4f}"
             })
 
-            # 常规步数保存（应对突然断电）
-            if self.global_step % self.args.save_steps == 0:
-                save_path = self.output_dir / f"unet_step_{self.global_step}.pt"
-                torch.save(self.unet.state_dict(), save_path)
-
-        # 返回当前 epoch 的平均 loss
         return {
             "loss": total_loss_epoch / num_batches,
             "img": total_img_loss / num_batches,
@@ -228,56 +243,141 @@ class UNetTrainer:
 
     @torch.no_grad()
     def visualize_epoch(self, epoch: int):
-        """利用 matplotlib 绘制并保存 Loss 曲线图"""
+        """生成【Loss 曲线 + 原图 + 验证图像】的终极全景看板"""
         if len(self.loss_history) == 0:
             return
 
+        # print(f"\n正在生成 Epoch {epoch} 的终极对比看板...")
+        self.unet.eval()
+        
+        # ==========================================
+        # 1. 准备 Loss 数据
+        # ==========================================
         epochs = [h[0] for h in self.loss_history]
         losses_total = [h[1] for h in self.loss_history]
         losses_img = [h[2] for h in self.loss_history]
         losses_dem = [h[3] for h in self.loss_history]
 
-        fig = plt.figure(figsize=(18, 5))
-        fig.suptitle(f"U-Net 8-Channel Training — Epoch {epoch}", fontsize=14, fontweight="bold")
+        # ==========================================
+        # 2. 准备真实的 Ground Truth (原图)
+        # ==========================================
+        # 原图在 dataloader 里被归一化到了 [-1, 1]，我们需要把它拉回 [0, 1] 才能画出来
+        gt_rgb_np = (self.val_rgb[0] / 2 + 0.5).clamp(0, 1).cpu().permute(1, 2, 0).numpy()
+        gt_dem_np = (self.val_dem[0] / 2 + 0.5).clamp(0, 1).cpu()[0].numpy() # [C, H, W] -> 取第一个通道
 
-        # 1. 绘制总 Loss
-        ax1 = fig.add_subplot(1, 3, 1)
+        # ==========================================
+        # 3. 运行逆向扩散，生成验证图像 (AI画的图)
+        # ==========================================
+        prompt = self.val_prompt[0] 
+        global_features, local_features = self.text_encoder([prompt])
+        # 从纯噪声开始
+        latents = torch.randn((1, 8, 64, 64), device=self.device)
+        self.noise_scheduler.set_timesteps(50)
+        
+        for t in tqdm(self.noise_scheduler.timesteps, desc="Sampling Image"):
+            noise_pred = self.unet(
+                noisy_latent=latents,
+                timestep=t.unsqueeze(0).to(self.device),
+                local_features=local_features,
+                global_features=global_features
+            )
+            latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
+            
+        rgb_latent, dem_latent = torch.chunk(latents, 2, dim=1)
+        rgb_latent = rgb_latent / 0.18215
+        dem_latent = dem_latent / 0.993099
+        
+        rgb_image = self.rgb_vae.decode(rgb_latent).sample
+        if self.dem_vae:
+            dem_image = self.dem_vae.decode(dem_latent).sample
+        else:
+            dem_image = self.rgb_vae.decode(dem_latent).sample
+            
+        rgb_image = (rgb_image / 2 + 0.5).clamp(0, 1)
+        dem_image = (dem_image / 2 + 0.5).clamp(0, 1)
+        
+        gen_rgb_np = rgb_image[0].permute(1, 2, 0).cpu().numpy()
+        gen_dem_np = dem_image[0][0].cpu().numpy()
+
+        # ==========================================
+        # 4. 绘制 2行4列 的终极大图
+        # ==========================================
+        fig = plt.figure(figsize=(22, 10)) # 加宽画布
+        fig.suptitle(f"U-Net 8-Channel Training Dashboard — Epoch {epoch}\nPrompt: '{prompt}'", fontsize=16, fontweight="bold")
+
+        # --- 第一行：Loss 曲线 (占前3个位置) ---
+        ax1 = fig.add_subplot(2, 4, 1)
         ax1.plot(epochs, losses_total, "b-", linewidth=1.5, marker='o', markersize=4)
         ax1.set_title("Total Loss")
         ax1.set_xlabel("Epoch")
         ax1.grid(True, alpha=0.3)
 
-        # 2. 绘制 RGB 图像 Loss
-        ax2 = fig.add_subplot(1, 3, 2)
+        ax2 = fig.add_subplot(2, 4, 2)
         ax2.plot(epochs, losses_img, "g-", linewidth=1.5, marker='o', markersize=4)
         ax2.set_title("RGB Texture Loss")
         ax2.set_xlabel("Epoch")
         ax2.grid(True, alpha=0.3)
 
-        # 3. 绘制 DEM 高程 Loss
-        ax3 = fig.add_subplot(1, 3, 3)
+        ax3 = fig.add_subplot(2, 4, 3)
         ax3.plot(epochs, losses_dem, "r-", linewidth=1.5, marker='o', markersize=4)
         ax3.set_title("DEM Height Loss")
         ax3.set_xlabel("Epoch")
         ax3.grid(True, alpha=0.3)
 
+        # --- 第一行第4个位置：文本信息区 ---
+        ax4 = fig.add_subplot(2, 4, 4)
+        ax4.axis('off')
+        latest_total = losses_total[-1]
+        ax4.text(0.5, 0.5, f"Current Total Loss:\n{latest_total:.4f}\n\nTop: Ground Truth\nBottom: Generated", 
+                 horizontalalignment='center', verticalalignment='center', 
+                 fontsize=18, fontweight="bold", color='#333333')
+
+        # --- 第二行：原图 vs 生成图 的残酷对比 ---
+        # 1. 真实 RGB
+        ax5 = fig.add_subplot(2, 4, 5)
+        ax5.imshow(gt_rgb_np)
+        ax5.set_title("[GT] Original RGB Texture", color='blue', fontweight='bold')
+        ax5.axis('off')
+
+        # 2. 生成 RGB
+        ax6 = fig.add_subplot(2, 4, 6)
+        ax6.imshow(gen_rgb_np)
+        ax6.set_title("[AI] Generated RGB Texture", color='darkgreen', fontweight='bold')
+        ax6.axis('off')
+
+        # 3. 真实 DEM
+        ax7 = fig.add_subplot(2, 4, 7)
+        ax7.imshow(gt_dem_np, cmap='gray')
+        ax7.set_title("[GT] Original DEM Heightmap", color='blue', fontweight='bold')
+        ax7.axis('off')
+
+        # 4. 生成 DEM
+        ax8 = fig.add_subplot(2, 4, 8)
+        ax8.imshow(gen_dem_np, cmap='gray')
+        ax8.set_title("[AI] Generated DEM Heightmap", color='darkgreen', fontweight='bold')
+        ax8.axis('off')
+
         plt.tight_layout()
-        save_path = self.viz_output_dir / f"loss_curve_epoch_{epoch:04d}.png"
+        plt.subplots_adjust(top=0.9) 
+        
+        save_path = self.viz_output_dir / f"dashboard_epoch_{epoch:04d}.png"
         fig.savefig(save_path, dpi=120)
         plt.close(fig)
+
+        self.unet.train()
 
     def train(self):
         """控制完整的训练循环，负责保存最佳状态"""
         print(f"=== 开始训练 8 通道 U-Net ===")
         print(f"数据集: {self.args.data_root}")
-        print(f"Batch Size: {self.args.batch_size} | Epochs: {self.args.epochs}")
+        print(f"Batch Size: {self.args.batch_size} | 目标 Epochs: {self.args.epochs}")
         print("-" * 50)
         
-        for epoch in range(self.args.epochs):
+        # 修改处：从 start_epoch 开始循环，而不是永远从 0 开始
+        for epoch in range(self.start_epoch, self.args.epochs):
             # 执行一个 Epoch 的训练
             avg_loss = self.train_epoch(epoch)
             
-            # 打印 Epoch 级日志
             print(
                 f"\nEpoch {epoch:3d} | "
                 f"Total Loss: {avg_loss['loss']:.4f} | "
@@ -285,15 +385,27 @@ class UNetTrainer:
                 f"Dem Loss: {avg_loss['dem']:.4f}"
             )
             
+            # 核心逻辑：每一轮结束，都无条件更新 latest_checkpoint.pt
+            latest_path = self.output_dir / "latest_checkpoint.pt"
+            torch.save({
+                "epoch": epoch,
+                "global_step": self.global_step,
+                "model_state_dict": self.unet.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+                "best_loss": self.best_loss,
+                "loss_history": self.loss_history
+            }, latest_path)
+            
             # 拦截并保存最佳模型
             if avg_loss["loss"] < self.best_loss:
-                print(f"🌟 发现新的最佳 Loss ({self.best_loss:.4f} -> {avg_loss['loss']:.4f})，正在保存...")
+                print(f"发现新的最佳 Loss ({self.best_loss:.4f} -> {avg_loss['loss']:.4f})，已保存为 best_unet.pt")
                 self.best_loss = avg_loss["loss"]
                 best_path = self.output_dir / "best_unet.pt"
+                # 最佳模型只需要存权重就够了，不用存优化器状态，省硬盘
                 torch.save({
                     "epoch": epoch,
                     "model_state_dict": self.unet.state_dict(),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
                     "best_loss": self.best_loss,
                 }, best_path)
             
@@ -310,7 +422,6 @@ class UNetTrainer:
                 self.visualize_epoch(epoch)
             
         print(f"\n训练圆满完成！历史最佳 Loss 为: {self.best_loss:.4f}")
-        # 训练结束后保存最后一轮的权重作为 final
         torch.save({
             "epoch": self.args.epochs - 1,
             "model_state_dict": self.unet.state_dict(),
@@ -318,7 +429,6 @@ class UNetTrainer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # 这里的 default 优先读取文件顶部的软编码大写变量
     parser.add_argument(
         "--data_root", 
         type=str, 
@@ -361,10 +471,21 @@ if __name__ == "__main__":
         default=SAVE_STEPS
     )
     
+    # 只需要传字符串 "True" 或 "False"
+    def str2bool(v):
+        return v.lower() in ("yes", "true", "t", "1")
+        
     parser.add_argument(
         "--use_amp", 
-        type=bool, 
+        type=str2bool, 
         default=USE_AMP
+    )
+    
+    parser.add_argument(
+        "--resume", 
+        type=str2bool, 
+        default=RESUME, 
+        help="是否从最新的检查点恢复训练"
     )
     
     parser.add_argument(
@@ -372,7 +493,7 @@ if __name__ == "__main__":
         type=int, 
         default=NUM_WORKERS
     )
-    
+
     parser.add_argument(
         "--viz_interval", 
         type=int, 
@@ -383,5 +504,3 @@ if __name__ == "__main__":
     
     trainer = UNetTrainer(args)
     trainer.train()
-
-    
