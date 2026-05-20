@@ -9,11 +9,11 @@ from tqdm import tqdm
 # 1. 配置文件夹路径 (请根据你的实际情况修改)
 # ==========================================
 # DEM 文件夹配置
-DEM_INPUT_DIR = r""
-DEM_OUTPUT_DIR = r"data/unet_training/dem"
+DEM_INPUT_DIR = r"D:\WorkSpace\Data\unet\dem"
+DEM_OUTPUT_DIR = r"D:\WorkSpace\Data\unet\dem_npy"
 
 # 卫星图文件夹配置
-SAT_INPUT_DIR = r"D:\WorkSpace\Data\unet\rgb"
+SAT_INPUT_DIR = r""
 SAT_OUTPUT_DIR = r"data/unet_training/rgb"
 
 # VAE 预处理时生成的全局参数文件路径

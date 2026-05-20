@@ -130,7 +130,7 @@ class UNetTrainer:
         # 3. 挂载空间压缩器 (两个 VAE)
         # ==========================================
         print("正在加载 SD 标准 VAE...")
-        self.rgb_vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="vae").to(self.device)
+        self.rgb_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(self.device)
         self.rgb_vae.eval()
         self.rgb_vae.requires_grad_(False)
 
@@ -332,7 +332,7 @@ class UNetTrainer:
                  horizontalalignment='center', verticalalignment='center', 
                  fontsize=18, fontweight="bold", color='#333333')
 
-        # --- 第二行：原图 vs 生成图 的残酷对比 ---
+        # --- 第二行：原图 vs 生成图 的对比 ---
         # 1. 真实 RGB
         ax5 = fig.add_subplot(2, 4, 5)
         ax5.imshow(gt_rgb_np)
