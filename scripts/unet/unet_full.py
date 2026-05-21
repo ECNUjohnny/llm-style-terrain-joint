@@ -3,15 +3,14 @@
 
 用法：
     # 正常全新训练
-    python ./scripts/unet/train_unet_full.py --epoch 3
+    python ./scripts/unet/unet_full.py --epoch 3
     
     # 自动寻找最新断点继续训练
-    python ./scripts/unet/train_unet_full.py --resume True
+    python ./scripts/unet/unet_full.py --resume True
 """
 
 import os
 import warnings
-
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 warnings.filterwarnings("ignore")
@@ -82,7 +81,13 @@ def build_8ch_unet_from_sd(device = "cuda"):
 
     old_conv_in = unet.conv_in
 
-    new_conv_in = nn.Conv2d(8, old_conv_in.out_channels, old_conv_in.kernel_size, old_conv_in.padding)
+    new_conv_in = nn.Conv2d(
+        in_channels=8, 
+        out_channels=old_conv_in.out_channels, 
+        kernel_size=old_conv_in.kernel_size, 
+        stride=old_conv_in.stride,     # 把原来的步长也安全继承过来
+        padding=old_conv_in.padding    # 指名道姓这是 padding
+    )
 
     with torch.no_grad():
         new_conv_in.weight[:, :4, :, :] = old_conv_in.weight.clone()
@@ -93,7 +98,13 @@ def build_8ch_unet_from_sd(device = "cuda"):
 
     old_conv_out = unet.conv_out
 
-    new_conv_out = nn.Conv2d(old_conv_out.in_channels, 8, old_conv_out.kernel_size, old_conv_out.padding)
+    new_conv_out = nn.Conv2d(
+        in_channels=old_conv_out.in_channels, 
+        out_channels=8, 
+        kernel_size=old_conv_out.kernel_size, 
+        stride=old_conv_out.stride, 
+        padding=old_conv_out.padding
+    )
 
     with torch.no_grad():
         new_conv_out.weight[:4, :, :, :] = old_conv_out.weight.clone()
@@ -143,8 +154,6 @@ class UNetTrainer:
         # 1. 组建做题家 (U-Net) 与优化器
         # ==========================================
         print("正在组装 8 通道 U-Net...")
-
-        # self.unet = build_unet(in_channels=8, out_channels=8).to(self.device)
         
         self.unet = build_8ch_unet_from_sd(self.device)
 
@@ -221,21 +230,23 @@ class UNetTrainer:
         print(f"验证样本准备就绪，提示词: {self.val_prompt[0]}")
 
     def encode_to_latent(self, rgb_pixels, dem_pixels):
-        """核心魔法：把像素变成隐向量，并处理尺寸不对齐的玄学 Bug"""
+        """核心魔法：把像素变成隐向量，并设立 64x64 绝对屏障"""
+        # 1. 官方 VAE，绝对标准的 64x64
         rgb_latent = self.rgb_vae.encode(rgb_pixels).latent_dist.sample() * 0.18215
         
+        # 2. 你们的 VAE，可能会吐出残疾的 62x62
         if self.dem_vae is not None:
             dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample() * 0.993099
         else:
             dem_pixels_3ch = dem_pixels.repeat(1, 3, 1, 1)
             dem_latent = self.rgb_vae.encode(dem_pixels_3ch).latent_dist.sample() * 0.18215
             
-        # 核心修复：强行对齐空间尺寸，抹平自定义 VAE 带来的像素丢失！
-        if rgb_latent.shape[2:] != dem_latent.shape[2:]:
-            # 使用双线性插值，强制把 dem_latent 的 [31, 31] 拉伸到匹配 rgb_latent 的 [32, 32]
+        # 3. 终极防御：如果 DEM 掉链子（比如变成了 62x62），强行把它拉伸到 RGB 的尺寸（64x64）！
+        # 千万不能反向把 RGB 缩小去迎合 DEM！
+        if dem_latent.shape[2:] != rgb_latent.shape[2:]:
             dem_latent = F.interpolate(
                 dem_latent, 
-                size=rgb_latent.shape[2:], 
+                size=rgb_latent.shape[2:], # 永远对齐官方的 64x64
                 mode="bilinear", 
                 align_corners=False
             )
@@ -260,6 +271,12 @@ class UNetTrainer:
             prompts = batch["prompt"]
             batch_size = rgb_pixels.shape[0]
 
+            TARGET_SIZE = (512, 512)
+            if rgb_pixels.shape[2:] != TARGET_SIZE:
+                rgb_pixels = F.interpolate(rgb_pixels, size=TARGET_SIZE, mode="bilinear", align_corners=False)
+            if dem_pixels.shape[2:] != TARGET_SIZE:
+                dem_pixels = F.interpolate(dem_pixels, size=TARGET_SIZE, mode="bilinear", align_corners=False)
+
             with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
                 with torch.no_grad():
                     global_features, local_features = self.text_encoder(prompts)
@@ -269,17 +286,18 @@ class UNetTrainer:
                 timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (batch_size,), device=self.device).long()
                 noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-                noise_pred = self.unet(
-                    noisy_latent=noisy_latents,
+                # [✨ 核心修复 1]：对接官方 U-Net 前向传播 API
+                output = self.unet(
+                    sample=noisy_latents,
                     timestep=timesteps,
-                    local_features=local_features,
-                    global_features=global_features,
+                    encoder_hidden_states=local_features
                 )
+                noise_pred = output.sample
                 
-                loss_dict = self.unet.loss(noise_pred, noise)
-                loss = loss_dict["loss"]
-                loss_img = loss_dict["loss_img"]
-                loss_dem = loss_dict["loss_dem"]
+                # [✨ 核心修复 2]：手动计算通道均方误差 (MSE Loss)
+                loss_img = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :])
+                loss_dem = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :])
+                loss = loss_img + loss_dem
 
             # 反向传播
             if self.scaler is not None:
@@ -317,7 +335,6 @@ class UNetTrainer:
         if len(self.loss_history) == 0:
             return
 
-        # print(f"\n正在生成 Epoch {epoch} 的终极对比看板...")
         self.unet.eval()
         
         # ==========================================
@@ -345,12 +362,14 @@ class UNetTrainer:
         self.noise_scheduler.set_timesteps(50)
         
         for t in tqdm(self.noise_scheduler.timesteps, desc="Sampling Image"):
-            noise_pred = self.unet(
-                noisy_latent=latents,
+            # [✨ 核心修复 3]：可视化时的逆向扩散推断 API
+            output = self.unet(
+                sample=latents,
                 timestep=t.unsqueeze(0).to(self.device),
-                local_features=local_features,
-                global_features=global_features
+                encoder_hidden_states=local_features
             )
+            noise_pred = output.sample
+            
             latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
             
         rgb_latent, dem_latent = torch.chunk(latents, 2, dim=1)
