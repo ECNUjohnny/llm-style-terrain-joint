@@ -110,7 +110,7 @@ def build_8ch_unet_from_sd(device = "cuda"):
 
     with torch.no_grad():
         new_conv_out.weight[:4, :, :, :] = old_conv_out.weight.clone()
-        new_conv_out.weight[4:, :, :, :] = torch.rand_like(old_conv_out.weight) * 0.05
+        new_conv_out.weight[4:, :, :, :] = torch.randn_like(old_conv_out.weight) * 0.01
         new_conv_out.bias[:4] = old_conv_out.bias.clone()
         new_conv_out.bias[4:] = torch.zeros_like(old_conv_out.bias)
     unet.conv_out = new_conv_out
@@ -126,10 +126,10 @@ def build_8ch_unet_from_sd(device = "cuda"):
     unet.conv_out.requires_grad_(True)
 
     for name, param in unet.named_parameters():
-        if "attn" in name: 
+        if "attn1" in name or "attn2" in name: 
             param.requires_grad = True
 
-        elif "up_blocks" in name:
+        elif "up_blocks.2" in name or "up_blocks.3" in name:
             param.requires_grad = True
         
         elif "down_blocks.0" in name or "down_blocks.1" in name:
@@ -155,7 +155,7 @@ class UNetTrainer:
 
         # 加载用于反归一化的参数
         import json
-        params_file = os.path.join(args.data_root, "norm_params.json")
+        params_file = os.path.join("./data/process/heightmaps_hf", "norm_params.json")
         with open(params_file, "r") as f:
             self.norm_params = json.load(f)
             print(f"成功加载高程反归一化参数: p_low={self.norm_params['p_low']}, min_log={self.norm_params['min_log']}")
@@ -291,7 +291,7 @@ class UNetTrainer:
 
             raw_dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample()
 
-            dem_latent = (raw_dem_latent - self.dem_latent_mean) / self.dem_latent_std * 0.993099
+            dem_latent = raw_dem_latent * 0.993099
         else:
             dem_pixels_3ch = dem_pixels.repeat(1, 3, 1, 1)
             dem_latent = self.rgb_vae.encode(dem_pixels_3ch).latent_dist.sample() * 0.18215
