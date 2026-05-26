@@ -161,7 +161,7 @@ class UNetDataset(Dataset):
 
         # 5. 最终映射到扩散模型所需的 [-1, 1] 区间
         rgb_tensor = self.normalize(rgb_tensor) 
-        dem_tensor = self.normalize(dem_tensor) 
+        # dem_tensor = self.normalize(dem_tensor) 
 
         return {
             "rgb": rgb_tensor,

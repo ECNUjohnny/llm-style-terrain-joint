@@ -59,7 +59,7 @@ OUTPUT_DIR = "./outputs/unet_8ch"   # 模型和图片输出的根目录
 
 EPOCHS = 50
 BATCH_SIZE = 4
-LEARNING_RATE = 3e-5
+LEARNING_RATE = 5e-5
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 USE_AMP = True                      # 是否开启 fp16 混合精度加速
@@ -237,6 +237,20 @@ class UNetTrainer:
 
         print(f"验证样本准备就绪，提示词: {self.val_prompt[0]}")
 
+        if self.dem_vae is not None:
+            with torch.no_grad():
+
+                test_dem_pixels = val_batch["dem"].to(self.device)
+
+                raw_latents = self.dem_vae.encode(test_dem_pixels).latent_dist.sample()
+
+                true_scaling_factor = 1.0 / raw_latents.std().item()
+
+                print(f"\n" + "="*50)
+                print(f"[重要检测] 你的 DEM VAE 真正的缩放因子算出来了！")
+                print(f"请将代码里的 0.993099 替换为: {true_scaling_factor:.6f}")
+                print("="*50 + "\n")
+
         prompt_output = self.viz_output_dir / "prompt.txt"
 
         with open(prompt_output, "w", encoding="utf-8") as f:
@@ -245,10 +259,10 @@ class UNetTrainer:
 
     def encode_to_latent(self, rgb_pixels, dem_pixels):
         """核心魔法：把像素变成隐向量，并设立 64x64 绝对屏障"""
-        # 1. 官方 VAE，绝对标准的 64x64
+        
         rgb_latent = self.rgb_vae.encode(rgb_pixels).latent_dist.sample() * 0.18215
         
-        # 2. 你们的 VAE，可能会吐出残疾的 62x62
+        
         if self.dem_vae is not None:
             dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample() * 0.993099
         else:
@@ -310,7 +324,21 @@ class UNetTrainer:
                 
                 # [核心修复 2]：手动计算通道均方误差 (MSE Loss)
                 loss_img = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :])
-                loss_dem = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :])
+                loss_dem_mse = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :])
+                
+                pred_dem = noise_pred[:, :4, :, :]
+                true_dem = noise[:, :4, :, :]
+
+                diff_x = torch.abs(pred_dem[:, :, :, 1:] - pred_dem[:, :, :, :-1]) - \
+                         torch.abs(true_dem[:, :, :, 1:] - true_dem[:, :, :, :-1])
+                
+                diff_y = torch.abs(pred_dem[:, :, 1:, :] - pred_dem[:, :, :-1, :]) - \
+                         torch.abs(true_dem[:, :, 1:, :] - true_dem[:, :, :-1, :])
+                
+                loss_slope = torch.mean(torch.abs(diff_x)) + torch.mean(torch.abs(diff_y))
+
+                loss_dem = loss_dem_mse + 0.5 * loss_slope
+
                 loss = loss_img + loss_dem
 
             # 反向传播
@@ -362,9 +390,9 @@ class UNetTrainer:
         # ==========================================
         # 2. 准备真实的 Ground Truth (原图)
         # ==========================================
-        # 原图在 dataloader 里被归一化到了 [-1, 1]，我们需要把它拉回 [0, 1] 才能画出来
+        
         gt_rgb_np = (self.val_rgb[0] / 2 + 0.5).clamp(0, 1).cpu().permute(1, 2, 0).numpy()
-        gt_dem_np = (self.val_dem[0] / 2 + 0.5).clamp(0, 1).cpu()[0].numpy() # [C, H, W] -> 取第一个通道
+        gt_dem_np = self.val_dem[0].clamp(0, 1).cpu()[0].numpy() # [C, H, W] -> 取第一个通道
 
         # ==========================================
         # 3. 运行逆向扩散，生成验证图像 (AI画的图)
@@ -393,14 +421,21 @@ class UNetTrainer:
         rgb_image = self.rgb_vae.decode(rgb_latent).sample
         if self.dem_vae:
             dem_image = self.dem_vae.decode(dem_latent).sample
+
+            dem_image = dem_image.clamp(0, 1)
         else:
             dem_image = self.rgb_vae.decode(dem_latent).sample
+
+            dem_image = (dem_image / 2 + 0.5).clamp(0, 1)
             
         rgb_image = (rgb_image / 2 + 0.5).clamp(0, 1)
-        dem_image = (dem_image / 2 + 0.5).clamp(0, 1)
+        # dem_image = (dem_image / 2 + 0.5).clamp(0, 1)
         
         gen_rgb_np = rgb_image[0].permute(1, 2, 0).cpu().numpy()
         gen_dem_np = dem_image[0][0].cpu().numpy()
+
+        print(f"\n[真实数值检测] 真实 DEM -> Min: {gt_dem_np.min():.4f}, Max: {gt_dem_np.max():.4f}")
+        print(f"[真实数值检测] 生成 DEM -> Min: {gen_dem_np.min():.4f}, Max: {gen_dem_np.max():.4f}")
 
         latest_output_dir = self.viz_output_dir / "latest_output"
         latest_output_dir.mkdir(parents=True, exist_ok=True)
