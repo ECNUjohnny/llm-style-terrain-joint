@@ -59,7 +59,7 @@ OUTPUT_DIR = "./outputs/unet_8ch"   # 模型和图片输出的根目录
 
 EPOCHS = 50
 BATCH_SIZE = 4
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 USE_AMP = True                      # 是否开启 fp16 混合精度加速
@@ -110,7 +110,7 @@ def build_8ch_unet_from_sd(device = "cuda"):
 
     with torch.no_grad():
         new_conv_out.weight[:4, :, :, :] = old_conv_out.weight.clone()
-        new_conv_out.weight[4:, :, :, :] = torch.zeros_like(old_conv_out.weight)
+        new_conv_out.weight[4:, :, :, :] = torch.rand_like(old_conv_out.weight) * 0.05
         new_conv_out.bias[:4] = old_conv_out.bias.clone()
         new_conv_out.bias[4:] = torch.zeros_like(old_conv_out.bias)
     unet.conv_out = new_conv_out
@@ -126,10 +126,10 @@ def build_8ch_unet_from_sd(device = "cuda"):
     unet.conv_out.requires_grad_(True)
 
     for name, param in unet.named_parameters():
-        if "attn2" in name: 
+        if "attn" in name: 
             param.requires_grad = True
 
-        elif "attn1" in name:
+        elif "up_blocks" in name:
             param.requires_grad = True
         
         elif "down_blocks.0" in name or "down_blocks.1" in name:
@@ -151,7 +151,15 @@ class UNetTrainer:
         self.viz_output_dir = self.output_dir / "visualizations"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.viz_output_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.dem_data = self.viz_output_dir / "dem_data.txt"
+
+        # 加载用于反归一化的参数
+        import json
+        params_file = os.path.join(args.data_root, "norm_params.json")
+        with open(params_file, "r") as f:
+            self.norm_params = json.load(f)
+            print(f"成功加载高程反归一化参数: p_low={self.norm_params['p_low']}, min_log={self.norm_params['min_log']}")
+
         # 用于记录画图的数据与进度
         self.loss_history = []  
         self.global_step = 0
@@ -251,6 +259,22 @@ class UNetTrainer:
                 print(f"请将代码里的 0.993099 替换为: {true_scaling_factor:.6f}")
                 print("="*50 + "\n")
 
+
+        self.dem_latent_mean = 0.0
+        self.dem_latent_std = 1.0
+
+        if self.dem_vae is not None:
+            with torch.no_grad():
+                test_dem_pixels = val_batch["dem"].to(self.device)
+                raw_latents = self.dem_vae.encode(test_dem_pixels).latent_dist.sample()
+                self.dem_latent_mean = raw_latents.mean().item()
+                self.dem_latent_std = raw_latents.std().item()
+                print(f"\n" + "="*50)
+                print(f"[自动校准完成] 已捕获 DEM VAE 的真实隐空间分布：")
+                print(f"均值 (Mean): {self.dem_latent_mean:.6f}")
+                print(f"标准差 (Std) : {self.dem_latent_std:.6f}")
+                print("="*50 + "\n")
+
         prompt_output = self.viz_output_dir / "prompt.txt"
 
         with open(prompt_output, "w", encoding="utf-8") as f:
@@ -264,7 +288,10 @@ class UNetTrainer:
         
         
         if self.dem_vae is not None:
-            dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample() * 0.993099
+
+            raw_dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample()
+
+            dem_latent = (raw_dem_latent - self.dem_latent_mean) / self.dem_latent_std * 0.993099
         else:
             dem_pixels_3ch = dem_pixels.repeat(1, 3, 1, 1)
             dem_latent = self.rgb_vae.encode(dem_pixels_3ch).latent_dist.sample() * 0.18215
@@ -404,6 +431,8 @@ class UNetTrainer:
         rgb_latent, dem_latent = torch.chunk(latents, 2, dim=1)
         rgb_latent = rgb_latent / 0.18215
         dem_latent = dem_latent / 0.993099
+
+        dem_latent = dem_latent * 1.5
         
         rgb_image = self.rgb_vae.decode(rgb_latent).sample
         if self.dem_vae:
@@ -424,11 +453,28 @@ class UNetTrainer:
         print(f"\n[真实数值检测] 真实 DEM -> Min: {gt_dem_np.min():.4f}, Max: {gt_dem_np.max():.4f}")
         print(f"[真实数值检测] 生成 DEM -> Min: {gen_dem_np.min():.4f}, Max: {gen_dem_np.max():.4f}")
 
+        with open(self.dem_data, "a", encoding="utf-8") as f:
+
+            f.write(f"Epoch {epoch} | Min {gen_dem_np.min():.4f}, Max {gen_dem_np.max():.4f}\n")
+
+
         latest_output_dir = self.viz_output_dir / "latest_output"
         latest_output_dir.mkdir(parents=True, exist_ok=True)
 
         rgb_save_array = (gen_rgb_np * 255).astype(np.uint8)
-        dem_save_array = (gen_dem_np * 65535.0).astype(np.uint16)
+
+
+        # 1. 读取用于反归一化的数据
+        p_low = self.norm_params["p_low"]
+        min_log = self.norm_params["min_log"]
+        max_log = self.norm_params["max_log"]
+
+        # 2. 将 U-Net 吐出的 [0, 1] 还原回原始数据
+        log_h = gen_dem_np * (max_log - min_log) + min_log
+        h_real = np.exp(log_h) + p_low - 1
+
+        # 3. 转为 3D 引擎能懂的 uint16
+        dem_save_array = np.round(np.clip(h_real, 0, 65535)).astype(np.uint16)
 
         Image.fromarray(rgb_save_array).save(latest_output_dir / "latest_texture.png")
         Image.fromarray(dem_save_array, mode='I;16').save(latest_output_dir / "latest_heightmap.png")
