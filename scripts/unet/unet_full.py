@@ -324,22 +324,9 @@ class UNetTrainer:
                 
                 # [核心修复 2]：手动计算通道均方误差 (MSE Loss)
                 loss_img = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :])
-                loss_dem_mse = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :])
-                
-                pred_dem = noise_pred[:, :4, :, :]
-                true_dem = noise[:, :4, :, :]
+                loss_dem = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :])
 
-                diff_x = torch.abs(pred_dem[:, :, :, 1:] - pred_dem[:, :, :, :-1]) - \
-                         torch.abs(true_dem[:, :, :, 1:] - true_dem[:, :, :, :-1])
-                
-                diff_y = torch.abs(pred_dem[:, :, 1:, :] - pred_dem[:, :, :-1, :]) - \
-                         torch.abs(true_dem[:, :, 1:, :] - true_dem[:, :, :-1, :])
-                
-                loss_slope = torch.mean(torch.abs(diff_x)) + torch.mean(torch.abs(diff_y))
-
-                loss_dem = loss_dem_mse + 0.5 * loss_slope
-
-                loss = loss_img + loss_dem
+                loss = loss_img + loss_dem * 1.5
 
             # 反向传播
             if self.scaler is not None:
