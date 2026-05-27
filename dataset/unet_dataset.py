@@ -20,7 +20,8 @@ class UNetDataset(Dataset):
         augment: bool = True,
         hflip_prob: float = 0.5,
         vflip_prob: float = 0.5,
-        rot90_prob: float = 0.5
+        rot90_prob: float = 0.5,
+        metadata_list: list = None
     ):
         super().__init__()
         self.data_root = data_root
@@ -34,7 +35,12 @@ class UNetDataset(Dataset):
         self.normalize = transforms.Normalize([0.5], [0.5]) # 将 [0, 1] 映射到 [-1, 1]
 
         # 自动解析元数据
-        self._parse_metadata()
+
+        if metadata_list is not None:
+            self.metadata = metadata_list
+        else:
+            self._parse_metadata()
+            
 
     def _parse_metadata(self):
         """
