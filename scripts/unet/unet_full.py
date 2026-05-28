@@ -58,14 +58,14 @@ OUTPUT_DIR = "./outputs/unet_8ch"
 
 EPOCHS = 50
 BATCH_SIZE = 4
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 USE_AMP = True
 VAL_SPLIT = 0.05  # 验证集比例
 SEED = 42
 USE_CFGE = 0.1  # 使用无分类引导的概率
-GUIDANCE_SCALE = 7.5
+GUIDANCE_SCALE = 4
 
 SAVE_STEPS = 12000
 LOG_STEPS = 10
@@ -152,8 +152,41 @@ class UNetTrainer:
         self.best_loss = float("inf")
 
         # 优化器
-        self.optimizer = torch.optim.AdamW(self.unet.parameters(), lr=args.learning_rate, weight_decay=WEIGHT_DECAY)
+        conv_params = []
+        core_params = []
+        
+        for name, param in self.unet.named_parameters():
+            if not param.requires_grad:
+                continue
+            # 将首尾卷积层（包含我们刚初始化的 4 个新通道）单独拎出来
+            if "conv_in" in name or "conv_out" in name:
+                conv_params.append(param)
+            else:
+                core_params.append(param)
+
+        # 核心网络使用传入的保守学习率 (如 2e-5)
+        # 首尾卷积层使用 5 倍学习率 (如 1e-4) 加速 DEM 通道成型
+        self.optimizer = torch.optim.AdamW([
+            {"params": core_params, "lr": args.learning_rate},
+            {"params": conv_params, "lr": args.learning_rate * 5.0} 
+        ], weight_decay=WEIGHT_DECAY)
+
         self.scaler = torch.amp.GradScaler("cuda") if args.use_amp else None
+
+        from diffusers.optimization import get_scheduler
+
+        if self.train_dataloader is not None:
+
+            self.total_steps = self.args.epochs * len(self.train_dataloader)
+
+            self.warmup_steps = int(self.total_steps * 0.05)
+
+            self.lr_scheduler = get_scheduler(
+                name="cosine",
+                optimizer=self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=self.total_steps
+            )
 
         # 加载环境模型 (CLIP, VAEs, Scheduler)
         print("正在加载 CLIP 和 VAE 环境...")
@@ -237,18 +270,62 @@ class UNetTrainer:
                 output = self.unet(sample=noisy_latents, timestep=timesteps, encoder_hidden_states=local_features)
                 noise_pred = output.sample
                 
-                loss_img = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :])
-                loss_dem = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :])
-                loss = loss_img + loss_dem * 1.5
+                # Min SNR机制
+
+                gamma = 5.0  # 截断阈值，5.0 是业界标准推荐值
+                alphas_cumprod = self.train_scheduler.alphas_cumprod.to(self.device)
+                
+                # 获取当前 Batch 时间步对应的 alpha 累乘值
+                alpha_prod_t = alphas_cumprod[timesteps]
+                beta_prod_t = 1 - alpha_prod_t
+
+                snr = alpha_prod_t / beta_prod_t
+                
+                # 计算 Min-SNR 权重：min(snr, gamma) / snr
+                min_snr_weight = torch.clamp(snr, max=gamma) / snr
+
+                # ==========================================================
+                # [修改] 2. 计算未求总均值的多任务 Loss
+                # ==========================================================
+                # reduction="none" 保证输出形状与输入一致，不急着求均值
+                loss_img_none = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none")
+                loss_dem_none = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :], reduction="none")
+                
+                # 把每张图的空间和通道维度(dim=1,2,3)拉平求均值，保留 batch 维度 (dim=0)
+                # 现在的尺寸是 [batch_size]
+                loss_img_batch = loss_img_none.mean(dim=[1, 2, 3])
+                loss_dem_batch = loss_dem_none.mean(dim=[1, 2, 3])
+                
+                # 按你的设定，依然使用 1.5 的高程权重
+                loss_batch = loss_img_batch + loss_dem_batch * 1.5
+                
+                # ==========================================================
+                # [新增] 3. 应用权重并得出最终 Loss
+                # ==========================================================
+                # 将每张图的 loss 乘以它自己的 Min-SNR 权重，最后再对 batch 求均值
+                loss = (loss_batch * min_snr_weight).mean()
+                
+                # 为了不影响下方进度条的打印，将独立 loss 也转为标量
+                loss_img = loss_img_batch.mean()
+                loss_dem = loss_dem_batch.mean()
 
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
+                # --- 新增：解缩放梯度并进行裁剪 ---
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.unet.parameters(), max_norm=1.0)
+                # ---------------------------------
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
+                # --- 新增：常规梯度裁剪 ---
+                torch.nn.utils.clip_grad_norm_(self.unet.parameters(), max_norm=1.0)
+                # ---------------------------------
                 self.optimizer.step()
                 
+            self.lr_scheduler.step()
+
             self.optimizer.zero_grad()
             
             total_loss_epoch += loss.item()
@@ -259,7 +336,10 @@ class UNetTrainer:
 
             pbar.set_postfix({"Loss": f"{total_loss_epoch/num_batches:.4f}", "Dem": f"{total_dem_loss/num_batches:.4f}"})
 
-        return {"loss": total_loss_epoch / num_batches, "img": total_img_loss / num_batches, "dem": total_dem_loss / num_batches}
+        return {"loss": total_loss_epoch / num_batches, 
+                "img": total_img_loss / num_batches, 
+                "dem": total_dem_loss / num_batches
+            }
 
     @torch.no_grad()
     def visualize_epoch(self, epoch: int):
@@ -393,10 +473,14 @@ class UNetTrainer:
             print(f"\nEpoch {epoch:3d} | Loss: {avg_loss['loss']:.4f} | Img: {avg_loss['img']:.4f} | Dem: {avg_loss['dem']:.4f}")
             
             torch.save({
-                "epoch": epoch, "global_step": self.global_step, "model_state_dict": self.unet.state_dict(),
+                "epoch": epoch, 
+                "global_step": self.global_step, 
+                "model_state_dict": self.unet.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(), 
                 "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
-                "best_loss": self.best_loss, "loss_history": self.loss_history
+                "scheduler_state_dict": self.lr_scheduler.state_dict(),
+                "best_loss": self.best_loss, 
+                "loss_history": self.loss_history
             }, self.output_dir / "latest_checkpoint.pt")
             
             if avg_loss["loss"] < self.best_loss:
@@ -425,13 +509,15 @@ class UNetTrainer:
             basename = batch["basename"][0]
             print(f"正在生成 {count+1}/{num_samples}: {basename} | Prompt: {prompt}")
 
-            guidance_scale = 7.5
+            guidance_scale = GUIDANCE_SCALE
             
             _, uncond_local_features = self.text_encoder([""])
             _, cond_local_features = self.text_encoder([prompt])
             local_features = torch.cat([uncond_local_features, cond_local_features])
 
-            latents = torch.randn((1, 8, 64, 64), device=self.device)
+            generator = torch.Generator(device=self.device).manual_seed(SEED + count)
+            latents = torch.randn((1, 8, 64, 64), generator=generator, device=self.device)
+
             # 注意：你的原代码 test 里写的是 noise_scheduler，但你初始化的是 infer_scheduler
             self.infer_scheduler.set_timesteps(50)
 
@@ -451,7 +537,7 @@ class UNetTrainer:
 
             rgb_latent, dem_latent = torch.chunk(latents, 2, dim=1)
             rgb_latent, dem_latent = rgb_latent / 0.18215, dem_latent / 0.993099
-            dem_latent = (dem_latent * self.dem_latent_std) + self.dem_latent_mean
+            # dem_latent = (dem_latent * self.dem_latent_std) + self.dem_latent_mean
             
             
             rgb_image = self.rgb_vae.decode(rgb_latent).sample
@@ -474,9 +560,19 @@ class UNetTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.unet.load_state_dict(checkpoint["model_state_dict"])
         if "optimizer_state_dict" in checkpoint and self.args.mode == "train":
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            if self.scaler and "scaler_state_dict" in checkpoint:
-                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if self.scaler and "scaler_state_dict" in checkpoint:
+                    self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            except ValueError as e:
+                print(f"\n[优化器警告] 检测到优化器参数组发生变化 (通常是因为修改了分层学习率)。")
+                print(f"安全跳过加载旧的优化器状态，动量将重新积累，不会影响模型权重！")
+                print(f"({e})\n")
+                
+            # <-- 新增：恢复调度器状态
+            if "scheduler_state_dict" in checkpoint and hasattr(self, 'lr_scheduler'):
+                self.lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                
             self.start_epoch = checkpoint["epoch"] + 1 
             self.global_step = checkpoint["global_step"]
             self.best_loss = checkpoint.get("best_loss", float("inf"))
