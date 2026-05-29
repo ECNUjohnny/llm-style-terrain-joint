@@ -164,7 +164,7 @@ class DiT8Channel(nn.Module):
         latent_size = 64
         self.num_patches = (latent_size // patch_size) ** 2  # 1024
 
-        time_embed_dim = hidden_size * 4
+        time_embed_dim = hidden_size  # must match hidden_size for PixArt-adaln compat
 
         # 1. Patch embedding
         self.patch_embed = nn.Conv2d(
