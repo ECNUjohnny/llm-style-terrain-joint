@@ -236,12 +236,104 @@ class DiT8Channel(nn.Module):
         global_features: torch.Tensor,
         local_features: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError("forward will be implemented in a later task")
+        """Forward pass: predict noise added to latent at given timestep.
+
+        Parameters
+        ----------
+        noisy_latent : Tensor [B, 8, H, W], H=W=64
+            Noisy joint latent.
+        timestep : Tensor [B]
+            Diffusion timestep indices.
+        global_features : Tensor [B, 768]
+            CLIP pooled output.
+        local_features : Tensor [B, 77, 768]
+            CLIP last_hidden_state.
+
+        Returns
+        -------
+        Tensor [B, 8, 64, 64]
+            Predicted noise.
+        """
+        # 1. Patchify: [B, 8, 64, 64] -> [B, 1024, hidden_size]
+        tokens = self.patch_embed(noisy_latent)  # [B, hidden_size, 32, 32]
+        tokens = tokens.flatten(2).transpose(1, 2)  # [B, 1024, hidden_size]
+        tokens = tokens + self.pos_embed
+
+        # 2. Timestep encoding
+        t_emb = self.time_proj(timestep).to(dtype=noisy_latent.dtype)
+        t_emb = self.time_embedding(t_emb)  # [B, time_embed_dim]
+
+        # 3. Global text injection
+        global_emb = self.global_text_proj(global_features)
+        conditioning = t_emb + global_emb  # [B, time_embed_dim]
+
+        # 4. Local text projection for cross-attention
+        encoder_hidden_states = self.local_text_proj(local_features)  # [B, 77, hidden_size]
+
+        # 5. Transformer blocks
+        for block in self.transformer_blocks:
+            tokens = block(
+                hidden_states=tokens,
+                conditioning=conditioning,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+
+        # 6. Output projection and unpatchify
+        tokens = self.final_norm(tokens)
+        tokens = self.final_linear(tokens)  # [B, 1024, out_channels * patch_size^2]
+        out = self._unpatchify(tokens)
+        return out
+
+    def _unpatchify(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Rearrange patch tokens back to spatial image.
+
+        Parameters
+        ----------
+        tokens : Tensor [B, num_patches, out_channels * patch_size^2]
+
+        Returns
+        -------
+        Tensor [B, out_channels, 64, 64]
+        """
+        B = tokens.shape[0]
+        latent_size = 64
+        grid_size = latent_size // self.patch_size  # 32
+        out_channels = self.out_channels
+        ps = self.patch_size
+
+        tokens = tokens.view(B, grid_size, grid_size, out_channels, ps, ps)
+        tokens = tokens.permute(0, 3, 1, 4, 2, 5).contiguous()
+        tokens = tokens.view(B, out_channels, latent_size, latent_size)
+        return tokens
 
     def loss(
         self, noise_pred: torch.Tensor, noise: torch.Tensor
     ) -> dict:
-        raise NotImplementedError("loss will be implemented in a later task")
+        """Channel-wise MSE loss with DEM channels weighted 1.5x.
+
+        RGB (channels 0-3) and DEM (channels 4-7) computed separately.
+
+        Returns
+        -------
+        dict
+            ``loss``: weighted total loss;
+            ``loss_img``: RGB channel MSE;
+            ``loss_dem``: DEM channel MSE.
+        """
+        img_noise_pred = noise_pred[:, :4, :, :]
+        dem_noise_pred = noise_pred[:, 4:, :, :]
+        img_noise = noise[:, :4, :, :]
+        dem_noise = noise[:, 4:, :, :]
+
+        loss_img = F.mse_loss(img_noise_pred, img_noise)
+        loss_dem = F.mse_loss(dem_noise_pred, dem_noise)
+        loss = loss_img + 1.5 * loss_dem
+
+        return {
+            "loss_img": loss_img,
+            "loss_dem": loss_dem,
+            "loss": loss,
+        }
 
 
 def build_dit(
