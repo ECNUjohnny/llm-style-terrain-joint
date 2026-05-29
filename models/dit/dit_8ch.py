@@ -1,11 +1,62 @@
 """
 PixArt-alpha 风格的 DiT (Diffusion Transformer)，用于 8 通道联合纹理-高程去噪。
+与 UNet8Channel 保持完全相同的 forward() / loss() 接口，可作为 drop-in 替换。
 
-基于 PixArt-alpha XL 架构：
-  - Patchify: 8×64×64 → 1024 tokens × 1152 dim (patch_size=2)
-  - Transformer blocks × 28: adaLN + Self-Attn + Cross-Attn + FFN
-  - 文本注入：全局特征 → adaLN 调制，局部特征 → cross-attn K/V
-  - 与 UNet8Channel 保持相同接口（forward + loss 签名完全一致）
+=== 架构概览 ===
+
+输入: [B, 8, 64, 64] 联合隐向量 + timestep [B] + global_features [B,768] + local_features [B,77,768]
+
+  Patch Embed
+    8×64×64 ──Conv2d(8,1152,k=2,s=2)──> [B, 1152, 32, 32]
+    ──Flatten──> [B, 1024 tokens, 1152 dim]
+    ──+ learnable pos_embed──> [B, 1024, 1152]
+
+  Timestep 编码
+    timestep ──sinusoidal(256)──> ──MLP(SiLU)──> [B, time_embed_dim=1152]
+
+  全局文本注入 (adaLN 调制)
+    global_features [B,768] ──Linear──> [B, 1152]
+    ──add with timestep embedding──> conditioning [B, 1152]
+
+  局部文本投影 (交叉注意力)
+    local_features [B,77,768] ──Linear──> [B, 77, 1152]
+    → 作为 cross-attn 的 K/V
+
+  Transformer Block × 28
+    ┌─ adaLN: shift/scale/gate ← MLP(conditioning)
+    ├─ Self-Attention: Q/K/V from tokens, 16 heads × 72 dim/head
+    ├─ Cross-Attention: Q from tokens, K/V from projected local features
+    └─ FFN: 1152 → 4608 → 1152 (4× expansion, GELU)
+
+  输出
+    ──Final LayerNorm──> [B, 1024, 1152]
+    ──Linear(1152, 32)──> [B, 1024, 32]  (8ch × 2²)
+    ──Unpatchify──> [B, 8, 64, 64]  噪声预测
+
+=== 关键参数 ===
+
+in_channels: 8      输入通道 (4 通道纹理 + 4 通道高程)
+out_channels: 8     输出通道
+patch_size: 2       Patch 尺寸，64→32 grid, 1024 tokens
+hidden_size: 1152   Transformer 隐藏维度
+depth: 28           Transformer block 数量
+num_heads: 16       自注意力头数
+cross_attention_dim: 768  CLIP ViT-L/14 隐藏维度
+参数量: ~934M (fp16 权重 ~1.87 GB)
+
+=== 预训练权重加载 ===
+
+load_pretrained(path) 从 PixArt-alpha XL (PixArtTransformer2DModel) 加载权重：
+  - Transformer blocks: attn1/attn2 的 qkv 合并 (PixArt 分离的 to_q/to_k/to_v → nn.MultiheadAttention 的 in_proj_weight)
+  - Patch embed: 4ch→8ch 通道扩展 (前 4ch 加载预训练，后 4ch 零初始化)
+  - 跳过层: global_text_proj, local_text_proj (CLIP 768≠T5 4096), pos_embed, adaLN_modulation (随机初始化)
+
+=== 与 UNet8Channel 接口对比 ===
+
+  forward(noisy_latent, timestep, global_features, local_features) → noise_pred
+  loss(noise_pred, noise) → {"loss": ..., "loss_img": ..., "loss_dem": ...}
+
+完全一致，train_pipeline.py 通过 model_type 参数切换，无需改动训练循环。
 """
 
 import torch

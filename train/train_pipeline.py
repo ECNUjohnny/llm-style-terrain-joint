@@ -1,12 +1,64 @@
 """
-UNet 训练流水线
+8 通道去噪模型训练流水线，支持 UNet 和 DiT 两种架构（通过 --model_type 切换）。
 
-管理 8 通道 U-Net 的完整训练流程：
-- 模型构建（UNet、CLIP 编码器、VAE 编码器）
-- 训练循环（AMP 混合精度、梯度累积、梯度裁剪）
-- 断点续训（checkpoint 保存/加载）
-- 可视化（loss 曲线）与 CSV 日志
-- 仅保留最新 checkpoint.pt 和最佳 best_checkpoint.pt，节省磁盘空间
+=== 使用方式 ===
+
+通过训练入口脚本调用（推荐）：
+    # UNet 训练
+    python scripts/unet/train_unet_full.py --epochs 50 --data_root ./data/unet_training
+
+    # DiT 训练
+    python scripts/dit/train_dit_full.py --epochs 50 --data_root ./data/unet_training
+
+也可通过代码直接调用：
+    import argparse
+    from train.train_pipeline import UNetTrainingPipeline
+
+    args = argparse.Namespace(
+        data_root="./data/unet_training",
+        output_dir="./outputs/unet_8ch",
+        epochs=50, batch_size=4, learning_rate=1e-4, weight_decay=1e-4,
+        num_workers=4, save_steps=1000, viz_interval=1, warmup_epochs=5,
+        use_amp=True, dem_vae_ckpt="", model_type="unet",  # model_type="dit" 切换 DiT
+    )
+    pipeline = UNetTrainingPipeline(args)
+    pipeline.train()
+
+=== 关键参数 ===
+
+--model_type str      去噪模型类型，"unet" (默认) 或 "dit"
+--data_root str       数据目录，含 rgb/、dem/、txt/ 三个子目录
+--epochs int          训练 epoch 数
+--batch_size int      批次大小 (UNet 默认 4, DiT 默认 2)
+--learning_rate float 学习率 (默认 1e-4)
+--use_amp             启用 AMP fp16 混合精度 (DiT 默认开启)
+--dem_vae_ckpt str    高度图 VAE checkpoint 路径 (可选)
+--checkpoint str      断点续训或测试用的 checkpoint 路径
+--mode train|test     运行模式
+
+DiT 专属参数 (通过 scripts/dit/train_dit_full.py 传入):
+--pretrained_path str PixArt-alpha 预训练权重路径 (默认 HuggingFace)
+--stage1_epochs int   Stage 1 burn-in epoch 数 (默认 10, 仅训练适配层)
+
+=== 训练流程 ===
+
+1. 构建模型：CLIP 文本编码器 (冻结) + SD VAE (冻结) + 高度图 VAE (可选, 冻结) + 去噪模型
+2. 编码阶段：RGB/DEM 像素 → VAE → 8ch 联合隐向量 [B,8,64,64]；文本 → CLIP → 全局+局部特征
+3. 去噪训练：DDPM 前向加噪 → 去噪模型预测噪声 → 计算 MSE 损失 → 反向传播
+4. 检查点：每 epoch 保存 checkpoint.pt (最新) 和 best_checkpoint.pt (最优)
+5. 日志：CSV (training_log.csv) + loss 曲线图 (visualizations/)
+
+=== 分阶段训练 (DiT) ===
+
+Stage 1 (burn-in): 冻结 DiT backbone，仅训练 CLIP 适配层 (global_text_proj, local_text_proj)
+Stage 2 (全量微调): 解冻所有参数，适配层学习率 10×
+Stage 切换由 scripts/dit/train_dit_full.py 自动管理，本 Pipeline 通过 end_epoch 参数配合。
+
+=== 注意事项 ===
+
+- 属性名 self.unet 同时用于 UNet 和 DiT，确保训练循环代码不改动
+- AMP + grad_checkpointing 互斥，二者只能选一
+- 梯度包含 NaN/Inf 时自动跳过该 batch 的更新
 """
 
 import csv
