@@ -11,7 +11,6 @@ PixArt-alpha 风格的 DiT (Diffusion Transformer)，用于 8 通道联合纹理
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
 
 from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 
