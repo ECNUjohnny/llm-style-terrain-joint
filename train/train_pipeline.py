@@ -81,11 +81,23 @@ class UNetTrainingPipeline:
 
     def _build_models(self) -> None:
         """构建 U-Net、CLIP 编码器和 VAE 编码器。"""
-        # U-Net
-        print("构建 8 通道 U-Net...")
-        self.unet = build_unet(
-            in_channels=8, out_channels=8, cross_attention_dim=768
-        ).to(self.device)
+        # 去噪模型（U-Net 或 DiT）
+        model_type = getattr(self.args, "model_type", "unet")
+        if model_type == "dit":
+            from models.dit.dit_8ch import build_dit
+            pretrained_path = getattr(self.args, "dit_pretrained_path", None)
+            print("构建 DiT 8 通道去噪模型...")
+            self.unet = build_dit(
+                pretrained_path=pretrained_path,
+                in_channels=8,
+                out_channels=8,
+                cross_attention_dim=768,
+            ).to(self.device)
+        else:
+            print("构建 8 通道 U-Net...")
+            self.unet = build_unet(
+                in_channels=8, out_channels=8, cross_attention_dim=768
+            ).to(self.device)
 
         # CLIP 编码器（冻结）
         print("加载 CLIP 文本编码器...")
@@ -455,7 +467,7 @@ class UNetTrainingPipeline:
     # 训练主循环
     # -------------------------------------------------------------------------
 
-    def train(self, start_epoch: int = 0) -> None:
+    def train(self, start_epoch: int = 0, end_epoch: int | None = None) -> None:
         """
         运行完整训练循环。
 
@@ -463,6 +475,8 @@ class UNetTrainingPipeline:
         ----------
         start_epoch : int
             起始 epoch 编号（用于断点续训）。
+        end_epoch : int | None
+            结束 epoch 编号（不包含），None 表示使用 args.epochs。
         """
         if start_epoch > 0:
             print(f"断点续训：从 Epoch {start_epoch} 开始，目标 {self.args.epochs} epochs")
@@ -483,7 +497,8 @@ class UNetTrainingPipeline:
             log_writer.writerow(header)
             log_f.flush()
 
-        for epoch in range(start_epoch, self.args.epochs):
+        end = end_epoch if end_epoch is not None else self.args.epochs
+        for epoch in range(start_epoch, end):
             avg_loss = self.train_epoch(epoch)
 
             if self.device.type == "cuda":
