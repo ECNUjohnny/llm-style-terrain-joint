@@ -53,10 +53,13 @@ _DEFAULT_LEARNING_RATE = 5e-5
 _DEFAULT_WEIGHT_DECAY = 1e-4
 _DEFAULT_NUM_WORKERS = 2
 _DEFAULT_USE_AMP = True
-_DEFAULT_SAVE_STEPS = 5000
+_DEFAULT_SAVE_STEPS = 1000
 _DEFAULT_VIZ_INTERVAL = 1
 _DEFAULT_WARMUP_EPOCHS = 5
 _DEFAULT_STAGE1_EPOCHS = 10
+_DEFAULT_SEED = 45
+_DEFAULT_SPLIT = 0.05
+_DEFAULT_NUM_SAMPLES = 5
 
 _DEFAULT_CFG_DROP_RATE = 0.1
 _DEFAULT_MIN_SNR_GAMMA = 5.0
@@ -94,6 +97,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="无分类器引导(CFG)的条件丢弃概率 (默认 0.1)")
     parser.add_argument("--min_snr_gamma", type=float, default=_DEFAULT_MIN_SNR_GAMMA,
                         help="Min-SNR 加权策略的截断阈值 (默认 5.0，设为 0 关闭)")
+    
+    parser.add_argument("--seed", type=int, default = _DEFAULT_SEED)
+
+    parser.add_argument("--split", type=float, default = _DEFAULT_SPLIT)
+
+    parser.add_argument("num_sample", type=int, default = _DEFAULT_NUM_SAMPLES)
 
     return parser
 

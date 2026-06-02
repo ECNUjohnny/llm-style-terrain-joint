@@ -288,7 +288,7 @@ class UNetTrainer:
                 # [修改] 2. 计算未求总均值的多任务 Loss
                 # ==========================================================
                 # reduction="none" 保证输出形状与输入一致，不急着求均值
-                loss_img_none = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none")
+                loss_img_none = F.huber_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none", delta=1.0)
                 loss_dem_none = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :], reduction="none")
                 
                 # 把每张图的空间和通道维度(dim=1,2,3)拉平求均值，保留 batch 维度 (dim=0)
