@@ -255,20 +255,12 @@ class UNetTrainingPipeline:
             drop_last=True,
         )
 
-        self.dataloader = DataLoader(
-            dataset,
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
-
         # 固定验证批次
         val_batch = next(iter(self.val_dataloader))
         self.val_rgb = val_batch["rgb"][:1].to(self.device)
         self.val_dem = val_batch["dem"][:1].to(self.device)
         self.val_prompt = val_batch["prompt"][:1]
+        self.val_basename = val_batch["basename"][0]
 
     # -------------------------------------------------------------------------
     # 编码工具
@@ -397,7 +389,7 @@ class UNetTrainingPipeline:
                     min_snr_weight = torch.ones_like(snr)
 
                 # 分别计算高低频特征的 Loss
-                loss_img_none = F.huber_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none", delta=1.0)
+                loss_img_none = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none")
                 loss_dem_none = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :], reduction="none")
                 
                 # [B] 维度的平均
@@ -550,64 +542,139 @@ class UNetTrainingPipeline:
     # 可视化
     # -------------------------------------------------------------------------
 
+    @torch.no_grad()
     def visualize_epoch(self, epoch: int) -> None:
-        """绘制 loss 曲线（总损失 / RGB / DEM）。"""
+        """绘制 loss 曲线与视觉对比图 (整合 unet_full 风格的 2x4 Dashboard)"""
         if not self.loss_history:
             return
 
+        self.unet.eval()
+
+        # =====================================================================
+        # 1. 准备 Ground Truth 数据与 Prompt
+        # =====================================================================
+        prompt = self.val_prompt[0]
+        # 将张量转换回 numpy 并确保在 [0, 1] 范围内
+        gt_rgb_np = (self.val_rgb[0] / 2 + 0.5).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+        gt_dem_np = self.val_dem[0][0].clamp(0, 1).cpu().numpy()
+
+        # =====================================================================
+        # 2. 跑一次 50 步的 DDIM 推理 (用于可视化展示)
+        # =====================================================================
+        guidance_scale = 4.0
+        num_inference_steps = 50
+        
+        # 提取文本特征
+        cond_pooled, cond_hidden = self.encode_text([prompt])
+        uncond_pooled, uncond_hidden = self.encode_text([""])
+        
+        # 初始化随机噪声
+        h, w = self.val_rgb.shape[2] // 8, self.val_rgb.shape[3] // 8
+        latents = torch.randn((1, 8, h, w), device=self.device)
+        
+        self.infer_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        
+        for t in tqdm(self.infer_scheduler.timesteps, desc="Dashboard Sampling", leave=False):
+            latent_model_input = torch.cat([latents] * 2)
+            latent_model_input = self.infer_scheduler.scale_model_input(latent_model_input, t)
+
+            t_input = torch.tensor([t] * 2, device=self.device)
+            pooled_input = torch.cat([uncond_pooled, cond_pooled])
+            hidden_input = torch.cat([uncond_hidden, cond_hidden])
+
+            with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
+                noise_pred = self.unet(
+                    noisy_latent=latent_model_input,
+                    timestep=t_input,
+                    global_features=pooled_input,
+                    local_features=hidden_input
+                )
+
+            # CFG 计算
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            latents = self.infer_scheduler.step(noise_pred, t, latents).prev_sample
+
+        # =====================================================================
+        # 3. VAE 解码并转为 Numpy
+        # =====================================================================
+        rgb_latent = 1 / 0.18215 * latents[:, :4, :, :]
+        dem_latent = latents[:, 4:, :, :]
+
+        with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
+            gen_rgb_tensor = self.rgb_vae.decode(rgb_latent).sample
+            if self.dem_vae is not None:
+                gen_dem_tensor = self.dem_vae.decode(dem_latent).sample
+            else:
+                gen_dem_tensor = self.rgb_vae.decode(dem_latent).sample
+                gen_dem_tensor = gen_dem_tensor.mean(dim=1, keepdim=True)
+
+        gen_rgb_np = (gen_rgb_tensor / 2 + 0.5).clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy()
+        gen_dem_np = gen_dem_tensor[0][0].clamp(0, 1).cpu().numpy()
+        
+        # =====================================================================
+        # 4. 绘制 2x4 的大画板
+        # =====================================================================
         epochs = [h[0] for h in self.loss_history]
         losses_total = [h[1] for h in self.loss_history]
         losses_img = [h[2] for h in self.loss_history]
         losses_dem = [h[3] for h in self.loss_history]
-        lr_vals = [
-            self.scheduler.get_last_lr()[0]
-            for _ in range(len(self.loss_history))
-        ]
+        
+        fig = plt.figure(figsize=(22, 10))
+        fig.suptitle(f"Training Dashboard — Epoch {epoch}\nPrompt: '{prompt}'", fontsize=16, fontweight="bold")
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(
-            f"UNet 8-Channel Training — Epoch {epoch}",
-            fontsize=14, fontweight="bold",
-        )
-
-        ax0 = axes[0, 0]
-        ax0.plot(epochs, losses_total, "b-", linewidth=1.0)
-        ax0.set_title("Total Loss")
-        ax0.set_xlabel("Epoch")
-        ax0.grid(True, alpha=0.3)
-
-        ax1 = axes[0, 1]
-        ax1.plot(epochs, losses_img, "g-", linewidth=1.0)
-        ax1.set_title("RGB Texture Loss")
-        ax1.set_xlabel("Epoch")
+        # 上半部分：3张 Loss 曲线 + 1张文本统计面板
+        ax1 = fig.add_subplot(2, 4, 1)
+        ax1.plot(epochs, losses_total, "b-", linewidth=1.5, marker='o', markersize=4)
+        ax1.set_title("Total Loss")
         ax1.grid(True, alpha=0.3)
 
-        ax2 = axes[1, 0]
-        ax2.plot(epochs, losses_dem, "r-", linewidth=1.0)
-        ax2.set_title("DEM Height Loss")
+        ax2 = fig.add_subplot(2, 4, 2)
+        ax2.plot(epochs, losses_img, "g-", linewidth=1.5, marker='o', markersize=4)
+        ax2.set_title("RGB Texture Loss")
         ax2.set_xlabel("Epoch")
         ax2.grid(True, alpha=0.3)
 
-        ax3 = axes[1, 1]
-        ax3.plot(epochs[-len(lr_vals):], lr_vals, "m-", linewidth=1.0)
-        ax3.set_title("Learning Rate")
+        ax3 = fig.add_subplot(2, 4, 3)
+        ax3.plot(epochs, losses_dem, "r-", linewidth=1.5, marker='o', markersize=4)
+        ax3.set_title("DEM Height Loss")
         ax3.set_xlabel("Epoch")
-        ax3.set_yscale("log")
         ax3.grid(True, alpha=0.3)
 
-        # 统计标注
-        if losses_total:
-            ax0.text(
-                0.02, 0.98,
-                f"Best: {min(losses_total):.4f}\nLast: {losses_total[-1]:.4f}",
-                transform=ax0.transAxes, fontsize=8,
-                verticalalignment="top",
-                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7),
-            )
+        ax4 = fig.add_subplot(2, 4, 4)
+        ax4.axis('off')
+        latest_total = losses_total[-1]
+        ax4.text(0.5, 0.5, f"Current Total Loss:\n{latest_total:.4f}\n\nTop: Ground Truth\nBottom: Generated", 
+                 horizontalalignment='center', verticalalignment='center', 
+                 fontsize=18, fontweight="bold", color='#333333')
 
-        plt.tight_layout()
-        fig.savefig(self.viz_output_dir / f"loss_epoch_{epoch:04d}.png", dpi=100)
+        # 下半部分：真实对比生成
+        ax5 = fig.add_subplot(2, 4, 5)
+        ax5.imshow(gt_rgb_np)
+        ax5.set_title(self.val_basename, color='blue', fontweight='bold')
+        ax5.axis('off')
+
+        ax6 = fig.add_subplot(2, 4, 6)
+        ax6.imshow(gen_rgb_np)
+        ax6.set_title("[AI] Generated Texture", color='darkgreen', fontweight='bold')
+        ax6.axis('off')
+
+        ax7 = fig.add_subplot(2, 4, 7)
+        ax7.imshow(gt_dem_np, cmap='gray')
+        ax7.set_title(self.val_basename, color='blue', fontweight='bold')
+        ax7.axis('off')
+
+        ax8 = fig.add_subplot(2, 4, 8)
+        ax8.imshow(gen_dem_np, cmap='gray')
+        ax8.set_title("[AI] Generated DEM", color='darkgreen', fontweight='bold')
+        ax8.axis('off')
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.savefig(self.viz_output_dir / f"dashboard_epoch_{epoch:04d}.png", dpi=120)
         plt.close(fig)
+        
+        self.unet.train()
 
     @torch.no_grad()
     def generate_validation_samples(
@@ -623,102 +690,105 @@ class UNetTrainingPipeline:
 
         count = 0
         
-        for batch in self.val_dataloader:
-            if count >= num_samples:
-                break
+        for i in range(4):
+            print(f"正在进行第{i}次推理:\n")
 
-            prompts = batch["prompt"]
-            basenames = batch["basename"]
-            b = len(prompts)
-            
-            # 1. 提取条件与无条件文本特征
-            cond_pooled, cond_hidden = self.encode_text(prompts)
-            uncond_pooled, uncond_hidden = self.encode_text([""] * b)
-            
-            # 2. 初始化随机纯噪声 (直接使用当前 batch 的尺寸更安全)
-            h, w = batch["rgb"].shape[2] // 8, batch["rgb"].shape[3] // 8
-            latents = torch.randn((b, 8, h, w), device=self.device)
-
-            # 3. 设置 DDIM 调度器时间步
-            self.infer_scheduler.set_timesteps(num_inference_steps, device=self.device)
-            p_low, min_log, max_log = self.norm_params["p_low"], self.norm_params["min_log"], self.norm_params["max_log"]
-
-            # 4. 反向去噪循环
-            for t in tqdm(self.infer_scheduler.timesteps, desc="Sampling", leave=False):
-                # 将 latent 复制一份：前半部分给无条件，后半部分给有条件
-                latent_model_input = torch.cat([latents] * 2)
-                latent_model_input = self.infer_scheduler.scale_model_input(latent_model_input, t)
-
-                t_input = torch.tensor([t] * (b * 2), device=self.device)
-                pooled_input = torch.cat([uncond_pooled, cond_pooled])
-                hidden_input = torch.cat([uncond_hidden, cond_hidden])
-
-                # 预测噪声
-                with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
-                    noise_pred = self.unet(
-                        noisy_latent=latent_model_input,
-                        timestep=t_input,
-                        global_features=pooled_input,
-                        local_features=hidden_input
-                    )
-
-                # 提取无条件和有条件的预测结果，应用 CFG 公式
-                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-
-                # 计算上一步 (t-1) 的 latent
-                latents = self.infer_scheduler.step(noise_pred, t, latents).prev_sample
-
-            # 5. VAE 解码回像素空间
-            # RGB 必须放大回原方差
-            rgb_latent = 1 / 0.18215 * latents[:, :4, :, :]
-            
-            dem_latent = latents[:, 4:, :, :] 
-
-            with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
-                rgb_imgs = self.rgb_vae.decode(rgb_latent).sample
-
-                if self.dem_vae is not None:
-                    dem_imgs = self.dem_vae.decode(dem_latent).sample
-                else:
-                    dem_imgs = self.rgb_vae.decode(dem_latent).sample
-                    dem_imgs = dem_imgs.mean(dim=1, keepdim=True)
-
-            # 6. 张量归一化：将模型输出映射回标准视觉范围
-            rgb_imgs = (rgb_imgs / 2 + 0.5).clamp(0, 1)  # [-1, 1] -> [0, 1]
-            dem_imgs = dem_imgs.clamp(0, 1)              # 假设 DEM 输出本身就在 [0, 1] 附近
-
-            # 7. 遍历 Batch 中的每一张图片，逐一处理并保存
-            for i in range(b):
+            for batch in self.val_dataloader:
                 if count >= num_samples:
                     break
+
+                prompts = batch["prompt"]
+                basenames = batch["basename"]
+                b = len(prompts)
+
+                # 1. 提取条件与无条件文本特征
+                cond_pooled, cond_hidden = self.encode_text(prompts)
+                uncond_pooled, uncond_hidden = self.encode_text([""] * b)
+
+                # 2. 初始化随机纯噪声 (直接使用当前 batch 的尺寸更安全)
+                h, w = batch["rgb"].shape[2] // 8, batch["rgb"].shape[3] // 8
+                latents = torch.randn((b, 8, h, w), device=self.device)
+
+                # 3. 设置 DDIM 调度器时间步
+                self.infer_scheduler.set_timesteps(num_inference_steps, device=self.device)
+                p_low, min_log, max_log = self.norm_params["p_low"], self.norm_params["min_log"], self.norm_params["max_log"]
+
+                # 4. 反向去噪循环
+                for t in tqdm(self.infer_scheduler.timesteps, desc="Sampling", leave=False):
+                    # 将 latent 复制一份：前半部分给无条件，后半部分给有条件
+                    latent_model_input = torch.cat([latents] * 2)
+                    latent_model_input = self.infer_scheduler.scale_model_input(latent_model_input, t)
+
+                    t_input = torch.tensor([t] * (b * 2), device=self.device)
+                    pooled_input = torch.cat([uncond_pooled, cond_pooled])
+                    hidden_input = torch.cat([uncond_hidden, cond_hidden])
+
+                    # 预测噪声
+                    with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
+                        noise_pred = self.unet(
+                            noisy_latent=latent_model_input,
+                            timestep=t_input,
+                            global_features=pooled_input,
+                            local_features=hidden_input
+                        )
+
+                    # 提取无条件和有条件的预测结果，应用 CFG 公式
+                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                    # 计算上一步 (t-1) 的 latent
+                    latents = self.infer_scheduler.step(noise_pred, t, latents).prev_sample
+
+                # 5. VAE 解码回像素空间
+                # RGB 必须放大回原方差
+                rgb_latent = 1 / 0.18215 * latents[:, :4, :, :]
+
+                dem_latent = latents[:, 4:, :, :] 
+
+                with torch.autocast(device_type="cuda", enabled=self.args.use_amp):
+                    rgb_imgs = self.rgb_vae.decode(rgb_latent).sample
+
+                    if self.dem_vae is not None:
+                        dem_imgs = self.dem_vae.decode(dem_latent).sample
+                    else:
+                        dem_imgs = self.rgb_vae.decode(dem_latent).sample
+                        dem_imgs = dem_imgs.mean(dim=1, keepdim=True)
+
+                # 6. 张量归一化：将模型输出映射回标准视觉范围
+                rgb_imgs = (rgb_imgs / 2 + 0.5).clamp(0, 1)  # [-1, 1] -> [0, 1]
+                dem_imgs = dem_imgs.clamp(0, 1)              # 假设 DEM 输出本身就在 [0, 1] 附近
+
+                # 7. 遍历 Batch 中的每一张图片，逐一处理并保存
+                for i in range(b):
+                    if count >= num_samples:
+                        break
+
+                    basename = basenames[i]
+
+                    # 转换 RGB 为 uint8 数组 (不再重复执行 /2+0.5)
+                    gen_rgb_np = rgb_imgs[i].permute(1, 2, 0).cpu().numpy()
+                    rgb_save_array = (gen_rgb_np * 255).astype(np.uint8)
+
+                    # 还原 DEM 
+                    gen_dem_np = dem_imgs[i][0].cpu().numpy()
+                    h_real = np.exp(gen_dem_np * (max_log - min_log) + min_log) + p_low - 1
+                    dem_save_array = np.round(np.clip(h_real, 0, 65535)).astype(np.uint16)
+
+                    # 拼接文件名并保存
                     
-                basename = basenames[i]
-                
-                # 转换 RGB 为 uint8 数组 (不再重复执行 /2+0.5)
-                gen_rgb_np = rgb_imgs[i].permute(1, 2, 0).cpu().numpy()
-                rgb_save_array = (gen_rgb_np * 255).astype(np.uint8)
-                
-                # 还原 DEM 
-                gen_dem_np = dem_imgs[i][0].cpu().numpy()
-                h_real = np.exp(gen_dem_np * (max_log - min_log) + min_log) + p_low - 1
-                dem_save_array = np.round(np.clip(h_real, 0, 65535)).astype(np.uint16)
-                
-                # 拼接文件名并保存
-                
-                out_rgb_path = self.viz_output_dir / f"{basename}_rgb.png"
-                out_dem_path = self.viz_output_dir / f"{basename}_dem.png"
-        
-                Image.fromarray(dem_save_array).save(out_dem_path)
-                Image.fromarray(rgb_save_array).save(out_rgb_path)
+                    out_rgb_path = self.viz_output_dir / f"{basename}_rgb.png"
+                    out_dem_path = self.viz_output_dir / f"{basename}_dem.png"
 
-                prompt_path = os.path.join(self.viz_output_dir, basename)
+                    Image.fromarray(dem_save_array).save(out_dem_path)
+                    Image.fromarray(rgb_save_array).save(out_rgb_path)
 
-                prompt_file = Path(prompt_path)
+                    prompt_path = os.path.join(self.viz_output_dir, f"{basename}.txt")
 
-                prompt_file.write_text(prompts[i], encoding='utf_8')
-                
-                count += 1  # <-- 致命修复：成功保存一张，计数器加 1
+                    prompt_file = Path(prompt_path)
+
+                    prompt_file.write_text(prompts[i], encoding='utf_8')
+
+                    count += 1  # <-- 致命修复：成功保存一张，计数器加 1
 
         tqdm.write(f"生成完毕！共生成 {count} 组图片，已保存至: {self.viz_output_dir}")
         self.unet.train()

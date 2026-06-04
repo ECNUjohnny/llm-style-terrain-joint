@@ -54,17 +54,17 @@ from models.clip.text_encoder import build_text_encoder
 
 DATA_ROOT = "./data/unet_training"
 DEM_VAE_CKPT = "./data/vae_model_data/best_checkpoint.pt" 
-OUTPUT_DIR = "./outputs/unet_8ch"
+OUTPUT_DIR = "/root/autodl-fs/unet_outputs"
 
 EPOCHS = 50
 BATCH_SIZE = 4
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 USE_AMP = True
 VAL_SPLIT = 0.05  # 验证集比例
-SEED = 42
-USE_CFGE = 0.2  # 使用无分类引导的概率
+SEED = 65
+USE_CFGE = 0.1  # 使用无分类引导的概率
 GUIDANCE_SCALE = 4 # 1代表完全原始的输出
 
 SAVE_STEPS = 12000
@@ -288,7 +288,7 @@ class UNetTrainer:
                 # [修改] 2. 计算未求总均值的多任务 Loss
                 # ==========================================================
                 # reduction="none" 保证输出形状与输入一致，不急着求均值
-                loss_img_none = F.huber_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none", delta=1.0)
+                loss_img_none = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none")
                 loss_dem_none = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :], reduction="none")
                 
                 # 把每张图的空间和通道维度(dim=1,2,3)拉平求均值，保留 batch 维度 (dim=0)
@@ -472,9 +472,7 @@ class UNetTrainer:
             avg_loss = self.train_epoch(epoch)
             print(f"\nEpoch {epoch:3d} | Loss: {avg_loss['loss']:.4f} | Img: {avg_loss['img']:.4f} | Dem: {avg_loss['dem']:.4f}")
             
-            trainable_state_dict = {
-                name: param for name, param in self.unet.named_parameters() if param.requires_grad
-            }
+            trainable_state_dict = self.unet.state_dict()
 
             torch.save({
                 "epoch": epoch, 
@@ -489,7 +487,16 @@ class UNetTrainer:
             
             if avg_loss["loss"] < self.best_loss:
                 self.best_loss = avg_loss["loss"]
-                torch.save({"epoch": epoch, "model_state_dict": trainable_state_dict}, self.output_dir / "best_unet.pt")
+                torch.save({
+                    "epoch": epoch, 
+                    "global_step": self.global_step, 
+                    "model_state_dict": trainable_state_dict,
+                    "optimizer_state_dict": self.optimizer.state_dict(), 
+                    "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+                    "scheduler_state_dict": self.lr_scheduler.state_dict(),
+                    "best_loss": self.best_loss, 
+                    "loss_history": self.loss_history
+                }, self.output_dir / "best_unet.pt")
             
             if epoch % 5 == 0:
 
@@ -512,84 +519,100 @@ class UNetTrainer:
 
         p_low, min_log, max_log = self.norm_params["p_low"], self.norm_params["min_log"], self.norm_params["max_log"]
 
-        count = 0
-        for batch in self.val_dataloader:
-            if count >= num_samples: break
+        for i in range(5):
+
+            print(f"正在进行第{i}次推理\n")
             
-            prompt = batch["prompt"][0]
-            basename = batch["basename"][0]
-            print(f"正在生成 {count+1}/{num_samples}: {basename} | Prompt: {prompt}")
+            count = 0
+            for batch in self.val_dataloader:
+                if count >= num_samples: break
 
-            guidance_scale = GUIDANCE_SCALE
-            
-            _, uncond_local_features = self.text_encoder([""])
-            _, cond_local_features = self.text_encoder([prompt])
-            local_features = torch.cat([uncond_local_features, cond_local_features])
+                prompt = batch["prompt"][0]
+                basename = batch["basename"][0]
+                print(f"正在生成 {count+1}/{num_samples}: {basename} | Prompt: {prompt}")
 
-            generator = torch.Generator(device=self.device).manual_seed(SEED + count)
-            latents = torch.randn((1, 8, 64, 64), generator=generator, device=self.device)
+                guidance_scale = GUIDANCE_SCALE
 
-            # 注意：你的原代码 test 里写的是 noise_scheduler，但你初始化的是 infer_scheduler
-            self.infer_scheduler.set_timesteps(50)
+                _, uncond_local_features = self.text_encoder([""])
+                _, cond_local_features = self.text_encoder([prompt])
+                local_features = torch.cat([uncond_local_features, cond_local_features])
 
-            for t in tqdm(self.infer_scheduler.timesteps, desc="Sampling", leave=False):
-                latent_model_input = torch.cat([latents] * 2)
-                
-                output = self.unet(
-                    sample=latent_model_input, 
-                    timestep=t.unsqueeze(0).to(self.device), 
-                    encoder_hidden_states=local_features
-                )
-                
-                noise_pred_uncond, noise_pred_text = output.sample.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                
-                latents = self.infer_scheduler.step(noise_pred, t, latents).prev_sample
+                latents = torch.randn((1, 8, 64, 64), device=self.device)
 
-            rgb_latent, dem_latent = torch.chunk(latents, 2, dim=1)
-            rgb_latent, dem_latent = rgb_latent / 0.18215, dem_latent / 0.993099
-            # dem_latent = (dem_latent * self.dem_latent_std) + self.dem_latent_mean
-            
-            
-            rgb_image = self.rgb_vae.decode(rgb_latent).sample
-            dem_image = self.dem_vae.decode(dem_latent).sample.clamp(0, 1) if self.dem_vae else self.rgb_vae.decode(dem_latent).sample.clamp(-1, 1) / 2 + 0.5
-            
-            gen_rgb_np = (rgb_image / 2 + 0.5).clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy()
-            gen_dem_np = dem_image[0][0].cpu().numpy()
+                # 注意：你的原代码 test 里写的是 noise_scheduler，但你初始化的是 infer_scheduler
+                self.infer_scheduler.set_timesteps(50)
 
-            h_real = np.exp(gen_dem_np * (max_log - min_log) + min_log) + p_low - 1
-            dem_save_array = np.round(np.clip(h_real, 0, 65535)).astype(np.uint16)
-            rgb_save_array = (gen_rgb_np * 255).astype(np.uint8)
+                for t in tqdm(self.infer_scheduler.timesteps, desc="Sampling", leave=False):
+                    latent_model_input = torch.cat([latents] * 2)
 
-            Image.fromarray(rgb_save_array).save(test_dir / f"{basename}_gen_texture.png")
-            Image.fromarray(dem_save_array, mode='I;16').save(test_dir / f"{basename}_gen_heightmap.png")
-            count += 1
+                    output = self.unet(
+                        sample=latent_model_input, 
+                        timestep=t.unsqueeze(0).to(self.device), 
+                        encoder_hidden_states=local_features
+                    )
+
+                    noise_pred_uncond, noise_pred_text = output.sample.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    latents = self.infer_scheduler.step(noise_pred, t, latents).prev_sample
+
+                rgb_latent, dem_latent = torch.chunk(latents, 2, dim=1)
+                rgb_latent, dem_latent = rgb_latent / 0.18215, dem_latent / 0.993099
+                # dem_latent = (dem_latent * self.dem_latent_std) + self.dem_latent_mean
+
+
+                rgb_image = self.rgb_vae.decode(rgb_latent).sample
+                dem_image = self.dem_vae.decode(dem_latent).sample.clamp(0, 1) if self.dem_vae else self.rgb_vae.decode(dem_latent).sample.clamp(-1, 1) / 2 + 0.5
+
+                gen_rgb_np = (rgb_image / 2 + 0.5).clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy()
+                gen_dem_np = dem_image[0][0].cpu().numpy()
+
+                h_real = np.exp(gen_dem_np * (max_log - min_log) + min_log) + p_low - 1
+                dem_save_array = np.round(np.clip(h_real, 0, 65535)).astype(np.uint16)
+                rgb_save_array = (gen_rgb_np * 255).astype(np.uint8)
+
+                Image.fromarray(rgb_save_array).save(test_dir / f"{basename}_{i}_gen_texture.png")
+                Image.fromarray(dem_save_array, mode='I;16').save(test_dir / f"{basename}_{i}_gen_heightmap.png")
+                count += 1
             
         print(f"\n测试完成! 生成的模型资产已保存至: {test_dir}")
 
     def load_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.unet.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        self.unet.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+        # print()
+
         if "optimizer_state_dict" in checkpoint and self.args.mode == "train":
-            try:
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                if self.scaler and "scaler_state_dict" in checkpoint:
-                    self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            except ValueError as e:
-                print(f"\n[优化器警告] 检测到优化器参数组发生变化 (通常是因为修改了分层学习率)。")
-                print(f"安全跳过加载旧的优化器状态，动量将重新积累，不会影响模型权重！")
-                print(f"({e})\n")
+            
+            if getattr(self.args, "finetune", False):
+
+                print(f"\n[微调模式启动] 已成功加载第 {checkpoint['epoch']} 轮的基础权重！")
+                print(f"安全丢弃旧优化器和调度器。将使用全新的学习率 {self.args.learning_rate} 重新积累动量。")
+                self.start_epoch = 0 # 微调时 epoch 重新从 0 算起
+            
+            else:
                 
-            # <-- 新增：恢复调度器状态
-            if "scheduler_state_dict" in checkpoint and hasattr(self, 'lr_scheduler'):
-                self.lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                
-            self.start_epoch = checkpoint["epoch"] + 1 
-            self.global_step = checkpoint["global_step"]
-            self.best_loss = checkpoint.get("best_loss", float("inf"))
-            self.loss_history = checkpoint.get("loss_history", [])
-            print(f"成功恢复训练状态！将从 Epoch {self.start_epoch} 继续。")
+                try:
+                    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    if self.scaler and "scaler_state_dict" in checkpoint:
+                        self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                except ValueError as e:
+                    print(f"\n[优化器警告] 检测到优化器参数组发生变化 (通常是因为修改了分层学习率)。")
+                    print(f"安全跳过加载旧的优化器状态，动量将重新积累，不会影响模型权重！")
+                    print(f"({e})\n")
+
+                # <-- 新增：恢复调度器状态
+                if "scheduler_state_dict" in checkpoint and hasattr(self, 'lr_scheduler'):
+                    self.lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+                self.start_epoch = checkpoint["epoch"] + 1 
+                self.global_step = checkpoint["global_step"]
+                self.best_loss = checkpoint.get("best_loss", float("inf"))
+                self.loss_history = checkpoint.get("loss_history", [])
+                print(f"成功恢复训练状态！将从 Epoch {self.start_epoch} 继续。")
         else:
+            print(f"这是第{checkpoint['epoch']}轮的数据\n")
             print("成功加载权重！")
 
 
@@ -669,6 +692,12 @@ def main():
         "--viz_interval", 
         type=int, 
         default=VIZ_INTERVAL
+    )
+
+    parser.add_argument(
+        "--finetune", 
+        action="store_true", 
+        help="开启精细微调模式（仅加载模型权重，重置优化器和调度器）"
     )
 
     args = parser.parse_args()

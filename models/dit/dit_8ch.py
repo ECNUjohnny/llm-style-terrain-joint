@@ -512,7 +512,7 @@ class DiT8Channel(nn.Module):
         img_noise = noise[:, :4, :, :]
         dem_noise = noise[:, 4:, :, :]
 
-        loss_img = F.huber_loss(img_noise_pred, img_noise, delta=1.0)
+        loss_img = F.mse_loss(img_noise_pred, img_noise)
         loss_dem = F.mse_loss(dem_noise_pred, dem_noise)
         loss = loss_img + loss_dem
 

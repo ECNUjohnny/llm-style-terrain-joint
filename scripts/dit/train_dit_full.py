@@ -46,7 +46,7 @@ from train.train_pipeline import UNetTrainingPipeline, test_noise_prediction
 _DEFAULT_DATA_ROOT = "./data/unet_training"
 _DEFAULT_DEM_VAE_CKPT = "./data/vae_model_data/best_checkpoint.pt"
 _DEFAULT_DIT_PRETRAINED = "PixArt-alpha/PixArt-XL-2-1024-MS"
-_DEFAULT_OUTPUT_DIR = "./outputs/dit_8ch"
+_DEFAULT_OUTPUT_DIR = "/root/autodl-fs/dit_outputs"
 _DEFAULT_EPOCHS = 50
 _DEFAULT_BATCH_SIZE = 2
 _DEFAULT_LEARNING_RATE = 5e-5
@@ -198,39 +198,77 @@ def main():
     # --- Train mode ---
     pipeline = UNetTrainingPipeline(args)
 
+    # 1. 第一步：仅在 CPU 内存中“偷看” Checkpoint (耗时几秒，0 显存消耗)
     if args.checkpoint:
-        start_epoch = pipeline.load_checkpoint(args.checkpoint)
+        print(f"正在读取 Checkpoint 元数据以确定训练阶段...")
+        ckpt = torch.load(args.checkpoint, map_location="cpu")
+        start_epoch = ckpt["epoch"] + 1
     else:
         start_epoch = 0
+        ckpt = None
 
-    # --- Staged training ---
-    if start_epoch < args.stage1_epochs and start_epoch < args.epochs:
-        print(f"\n{'='*60}")
-        print(f"Stage 1: Burn-in 适配层 (Epochs {start_epoch}-{args.stage1_epochs - 1})")
-        print(f"{'='*60}")
-        pipeline.optimizer = setup_staged_optimizer(
-            pipeline.unet, args.learning_rate, args.weight_decay, stage=1
-        )
-        pipeline.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            pipeline.optimizer,
-            T_max=max(1, args.stage1_epochs - start_epoch),
-            eta_min=args.learning_rate * 1e-3,
-        )
+    # 2. 第二步：根据读到的 epoch，推断当前属于哪个 Stage
+    current_stage = 1 if (start_epoch < args.stage1_epochs) else 2
+    
+    print(f"\n{'='*60}")
+    stage_name = "Burn-in 适配层" if current_stage == 1 else "全量微调"
+    print(f"Stage {current_stage}: {stage_name} (从 Epoch {start_epoch} 开始)")
+    print(f"{'='*60}")
+
+    # 3. 第三步：构建与当前 Stage 匹配的优化器和调度器结构
+    pipeline.optimizer = setup_staged_optimizer(
+        pipeline.unet, args.learning_rate, args.weight_decay, stage=current_stage
+    )
+    
+    total_stage_epochs = args.stage1_epochs if current_stage == 1 else (args.epochs - args.warmup_epochs)
+    pipeline.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        pipeline.optimizer,
+        T_max=max(1, total_stage_epochs - start_epoch),
+        eta_min=args.learning_rate * 1e-3,
+    )
+
+    # 4. 第四步：结构就绪，安全地把数据灌入 GPU 模型和优化器中
+    if ckpt:
+        print("正在将权重拷贝至 GPU 显存...")
+        # load_state_dict 会自动把 CPU 里的权重 copy 到模型所在的 GPU 上，极其安全
+        pipeline.unet.load_state_dict(ckpt["model_state_dict"])
+        pipeline.global_step = ckpt.get("global_step", 0)
+        pipeline.best_loss = ckpt.get("best_loss", float("inf"))
+        pipeline.loss_history = ckpt.get("loss_history", [])
+        
+        if pipeline.scaler and "scaler_state_dict" in ckpt:
+            pipeline.scaler.load_state_dict(ckpt["scaler_state_dict"])
+
+        try:
+            pipeline.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            pipeline.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            print(f"成功恢复 Stage {current_stage} 的优化器和调度器动量状态！")
+        except ValueError as e:
+            print(f"[警告] 参数组发生变化（可能跨阶段），安全跳过优化器状态恢复：{e}")
+            
+        # 极其重要：手工释放内存中的 5GB 字典，防止内存泄漏
+        del ckpt 
+
+    # 5. 第五步：正式起飞
+    if current_stage == 1:
         pipeline.train(start_epoch=start_epoch, end_epoch=args.stage1_epochs)
-        start_epoch = args.stage1_epochs
-
-    if start_epoch < args.epochs:
-        print(f"\n{'='*60}")
-        print(f"Stage 2: 全量微调 (Epochs {start_epoch}-{args.epochs - 1})")
-        print(f"{'='*60}")
-        pipeline.optimizer = setup_staged_optimizer(
-            pipeline.unet, args.learning_rate, args.weight_decay, stage=2
-        )
-        pipeline.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            pipeline.optimizer,
-            T_max=max(1, args.epochs - args.warmup_epochs - start_epoch),
-            eta_min=args.learning_rate * 1e-3,
-        )
+        
+        # 如果 Stage 1 跑完，目标 epoch 还没到，丝滑切入 Stage 2
+        if args.stage1_epochs < args.epochs:
+            print(f"\n{'='*60}")
+            print(f"Stage 2: 全量微调 (Epochs {args.stage1_epochs}-{args.epochs - 1})")
+            print(f"{'='*60}")
+            pipeline.optimizer = setup_staged_optimizer(
+                pipeline.unet, args.learning_rate, args.weight_decay, stage=2
+            )
+            pipeline.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                pipeline.optimizer,
+                T_max=max(1, args.epochs - args.warmup_epochs - args.stage1_epochs),
+                eta_min=args.learning_rate * 1e-3,
+            )
+            pipeline.train(start_epoch=args.stage1_epochs)
+    else:
+        # 如果断点本身就在 Stage 2，直接跑完剩下的
         pipeline.train(start_epoch=start_epoch)
 
 
