@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models import AutoencoderKL
 
@@ -59,9 +58,9 @@ class HeightMapVAE(AutoencoderKL):
         )
         self.register_buffer(
             "laplacian",
-            torch.tensor(
-                [[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32
-            ).view(1, 1, 3, 3),
+            torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32).view(
+                1, 1, 3, 3
+            ),
             persistent=False,
         )
 
