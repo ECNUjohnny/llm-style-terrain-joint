@@ -31,8 +31,7 @@ def scan_main(data_dir: str):
             missing.append(label)
     if missing:
         print(
-            f"缺少子目录 / Missing subdirectories — {', '.join(missing)}  "
-            f"in {data_dir}"
+            f"缺少子目录 / Missing subdirectories — {', '.join(missing)}  in {data_dir}"
         )
         return
 
@@ -54,13 +53,8 @@ def scan_main(data_dir: str):
     all_basenames = dem_basenames | rgb_basenames | txt_basenames
     intersect = dem_basenames & rgb_basenames & txt_basenames
 
-    print(
-        f"去重 basename 总数 / Unique basenames: {len(all_basenames)}"
-    )
-    print(
-        f"三目录完全匹配 / Fully matched (dem+ rgb+ txt): "
-        f"{len(intersect)}"
-    )
+    print(f"去重 basename 总数 / Unique basenames: {len(all_basenames)}")
+    print(f"三目录完全匹配 / Fully matched (dem+ rgb+ txt): {len(intersect)}")
 
     only_dem = dem_basenames - rgb_basenames - txt_basenames
     only_rgb = rgb_basenames - dem_basenames - txt_basenames
@@ -71,11 +65,17 @@ def scan_main(data_dir: str):
     only_rgb_txt = (rgb_basenames & txt_basenames) - dem_basenames
 
     if only_dem:
-        print(f"  仅 dem / dem only: {len(only_dem)}  — {sorted(only_dem)[:5]}{'...' if len(only_dem) > 5 else ''}")
+        print(
+            f"  仅 dem / dem only: {len(only_dem)}  — {sorted(only_dem)[:5]}{'...' if len(only_dem) > 5 else ''}"
+        )
     if only_rgb:
-        print(f"  仅 rgb / rgb only: {len(only_rgb)}  — {sorted(only_rgb)[:5]}{'...' if len(only_rgb) > 5 else ''}")
+        print(
+            f"  仅 rgb / rgb only: {len(only_rgb)}  — {sorted(only_rgb)[:5]}{'...' if len(only_rgb) > 5 else ''}"
+        )
     if only_txt:
-        print(f"  仅 txt / txt only: {len(only_txt)}  — {sorted(only_txt)[:5]}{'...' if len(only_txt) > 5 else ''}")
+        print(
+            f"  仅 txt / txt only: {len(only_txt)}  — {sorted(only_txt)[:5]}{'...' if len(only_txt) > 5 else ''}"
+        )
     if only_dem_rgb:
         print(f"  dem+rgb (缺txt) / dem+rgb (no txt): {len(only_dem_rgb)}")
     if only_dem_txt:
@@ -114,7 +114,9 @@ def scan_main(data_dir: str):
     print(f"  全局最大值 / Global max:          {max(max_vals):.6f}")
     print(f"  文件均值之均值 / Mean of means:   {np.mean(mean_vals):.6f}")
     print(f"  文件均值之中位数 / Median of means: {np.median(mean_vals):.6f}")
-    print(f"  总数据量 / Total data:            {sum(os.path.getsize(f) for f in dem_files) / (1024**2):.2f} MiB")
+    print(
+        f"  总数据量 / Total data:            {sum(os.path.getsize(f) for f in dem_files) / (1024**2):.2f} MiB"
+    )
     print()
 
     # ── rgb 统计 ──
@@ -149,7 +151,9 @@ def scan_main(data_dir: str):
         print(f"  全局像素最小值 / Global pixel min:  {min(rgb_min):.2f}")
         print(f"  全局像素最大值 / Global pixel max:  {max(rgb_max):.2f}")
         print(f"  文件均值之均值 / Mean of means:     {np.mean(rgb_mean):.2f}")
-    print(f"  总数据量 / Total data:              {sum(os.path.getsize(f) for f in rgb_files) / (1024**2):.2f} MiB")
+    print(
+        f"  总数据量 / Total data:              {sum(os.path.getsize(f) for f in rgb_files) / (1024**2):.2f} MiB"
+    )
     print()
 
     # ── txt 统计 ──
@@ -173,13 +177,21 @@ def scan_main(data_dir: str):
     if empty_count:
         print(f"  空文件 / Empty files:           {empty_count}")
     if char_lens:
-        print(f"  字符数 / Character count:")
-        print(f"    min: {min(char_lens)},  max: {max(char_lens)},  mean: {np.mean(char_lens):.0f},  median: {np.median(char_lens):.0f}")
-        print(f"  单词数 / Word count:")
-        print(f"    min: {min(word_lens)},  max: {max(word_lens)},  mean: {np.mean(word_lens):.0f},  median: {np.median(word_lens):.0f}")
-        print(f"  行数 / Line count:")
-        print(f"    min: {min(line_counts)},  max: {max(line_counts)},  mean: {np.mean(line_counts):.0f},  median: {np.median(line_counts):.0f}")
-    print(f"  总数据量 / Total data:          {sum(os.path.getsize(f) for f in txt_files) / 1024:.2f} KiB")
+        print("  字符数 / Character count:")
+        print(
+            f"    min: {min(char_lens)},  max: {max(char_lens)},  mean: {np.mean(char_lens):.0f},  median: {np.median(char_lens):.0f}"
+        )
+        print("  单词数 / Word count:")
+        print(
+            f"    min: {min(word_lens)},  max: {max(word_lens)},  mean: {np.mean(word_lens):.0f},  median: {np.median(word_lens):.0f}"
+        )
+        print("  行数 / Line count:")
+        print(
+            f"    min: {min(line_counts)},  max: {max(line_counts)},  mean: {np.mean(line_counts):.0f},  median: {np.median(line_counts):.0f}"
+        )
+    print(
+        f"  总数据量 / Total data:          {sum(os.path.getsize(f) for f in txt_files) / 1024:.2f} KiB"
+    )
     print("─" * 60)
 
     # ── 总体概要 ──
@@ -192,7 +204,9 @@ def scan_main(data_dir: str):
     print("总体概要 / Overall summary:")
     print(f"  完整样本数 / Complete samples (dem+rgb+txt): {len(intersect)}")
     print(f"  总文件数 / Total files:                      {total_files}")
-    print(f"  总数据量 / Total size:                       {total_bytes / (1024**2):.2f} MiB")
+    print(
+        f"  总数据量 / Total size:                       {total_bytes / (1024**2):.2f} MiB"
+    )
     print("─" * 60)
 
 
