@@ -284,6 +284,12 @@ class UNetTrainer:
         if self.dem_vae is not None:
             dem_latent = self.dem_vae.encode(dem_pixels).latent_dist.sample()
         else:
+            """
+            回退路径：如果 dem_vae 为 None（例如未提供 checkpoint），
+            则将 DEM 单通道复制为 3 通道（repeat(1,3,1,1)），然后送入 RGB VAE（AutoencoderKL），
+            并乘以缩放因子 0.18215，同样得到 4 通道隐向量。
+            尽量不要产生回退
+            """
             dem_pixels_3ch = dem_pixels.repeat(1, 3, 1, 1)
             dem_latent = (
                 self.rgb_vae.encode(dem_pixels_3ch).latent_dist.sample() * 0.18215

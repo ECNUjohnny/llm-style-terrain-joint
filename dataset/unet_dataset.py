@@ -22,7 +22,7 @@ class UNetDataset(Dataset):
         hflip_prob: float = 0.5,
         vflip_prob: float = 0.5,
         rot90_prob: float = 0.5,
-        metadata_list: list = None
+        metadata_list: list = None,
     ):
         super().__init__()
         self.data_root = data_root
@@ -41,7 +41,6 @@ class UNetDataset(Dataset):
             self.metadata = metadata_list
         else:
             self._parse_metadata()
-            
 
     def _parse_metadata(self):
         """
@@ -96,15 +95,15 @@ class UNetDataset(Dataset):
         读取 .npy 或常见图像格式，统一转为 [3, 512, 512]、值域 [0, 1] 的 Tensor
         """
         if rgb_path.endswith(".npy"):
-            arr = np.load(rgb_path) # 之前你保存的应该是 [H, W, 3] 的 uint8 数组
-            
+            arr = np.load(rgb_path)  # 之前你保存的应该是 [H, W, 3] 的 uint8 数组
+
             # 为了使用 PIL 高质量缩放，先确保数据是 uint8 格式
             if arr.dtype != np.uint8:
-                if arr.max() <= 1.0: # 防御性编程：万一是被归一化过的 float 数据
+                if arr.max() <= 1.0:  # 防御性编程：万一是被归一化过的 float 数据
                     arr = (arr * 255).astype(np.uint8)
                 else:
                     arr = arr.astype(np.uint8)
-            
+
             # 转换为 PIL Image 进行尺寸调整
             img = Image.fromarray(arr, mode="RGB")
         else:
@@ -114,15 +113,15 @@ class UNetDataset(Dataset):
         # 尺寸对齐
         if img.size != (self.image_size, self.image_size):
             img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
-            
+
         # to_tensor 自动将 uint8 的 HWC 图像转换为 [0, 1] 的 CHW Tensor
-        tensor = self.to_tensor(img) 
+        tensor = self.to_tensor(img)
         return tensor
 
     def _load_dem_to_tensor(self, dem_path: str) -> torch.Tensor:
         """兼容读取 .npy 和常见图像格式的 DEM，并统一转为 [1, 512, 512] 的 Tensor"""
         if dem_path.endswith(".npy"):
-            arr = np.load(dem_path) # [H, W] float32
+            arr = np.load(dem_path)  # [H, W] float32
             if arr.shape != (self.image_size, self.image_size):
                 img = Image.fromarray(arr).resize(
                     (self.image_size, self.image_size), Image.Resampling.LANCZOS
@@ -147,16 +146,16 @@ class UNetDataset(Dataset):
                 prompt = f.read().strip()
 
         # 2. 读取 RGB 并缩放至目标尺寸
-        rgb_tensor = self._load_rgb_to_tensor(entry["rgb_path"]) # [3, 512, 512], 值域 [0, 1]
+        rgb_tensor = self._load_rgb_to_tensor(
+            entry["rgb_path"]
+        )  # [3, 512, 512], 值域 [0, 1]
 
         # 3. 读取 DEM 高程图并缩放
         dem_tensor = self._load_dem_to_tensor(
             entry["dem_path"]
         )  # [1, 512, 512], 值域 [0, 1]
 
-        # ==========================================
-        # 4. 同步数据增强 (在 Tensor 级别操作，绝不错位)
-        # ==========================================
+        # 4. 同步数据增强, 在 Tensor 级别操作
         if self.augment:
             if self.hflip_prob > 0 and torch.rand(1).item() < self.hflip_prob:
                 rgb_tensor = torch.flip(rgb_tensor, dims=[-1])
