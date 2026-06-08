@@ -21,3 +21,6 @@ AGENTS.md
 superpowers
 
 .vscode/
+
+# PR-review reports
+docs/*_review.md
