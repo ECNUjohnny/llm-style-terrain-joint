@@ -1,10 +1,10 @@
 """
 推理流水线 — 已搁置
 
-本模块为骨架占位。训练后的模型推理请直接使用训练脚本的 --mode test:
+本模块为骨架占位。当前推理通过训练脚本的 --mode test 完成：
     python scripts/unet/unet_full.py --mode test --checkpoint <path>
 
-历史设计文档保留如下供参考。
+待 U-Net/DiT 训练方案确定后，统一在此处总写完整的推理流水线。
 """
 
 
