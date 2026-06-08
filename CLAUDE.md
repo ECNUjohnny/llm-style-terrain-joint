@@ -25,18 +25,14 @@ uv run python scripts/height_vae/train_height_vae_full.py --epochs 100
 uv run python scripts/height_vae/train_height_vae.py --mode test --checkpoint <path>
 
 # U-Net training (requires data_root with rgb/, dem/, txt/ subdirectories)
-uv run python scripts/unet/train_unet_full.py --epochs 50
+uv run python scripts/unet/unet_full.py --mode train --epochs 50
 # U-Net test noise prediction
-uv run python scripts/unet/train_unet_full.py --mode test --checkpoint <path>
+uv run python scripts/unet/unet_full.py --mode test --checkpoint <path>
 # U-Net resume training
-uv run python scripts/unet/train_unet_full.py --epochs 100 --checkpoint ./outputs/unet_8ch/checkpoint.pt
+uv run python scripts/unet/unet_full.py --mode train --epochs 100 --checkpoint ./outputs/unet_8ch/checkpoint.pt
 
-# DiT training (PixArt-alpha XL, 934M params, ~20GB VRAM with B=2 + grad_ckpt)
-uv run python scripts/dit/train_dit_full.py --epochs 50
-# DiT resume
-uv run python scripts/dit/train_dit_full.py --epochs 100 --checkpoint ./outputs/dit_8ch/checkpoint.pt
-# DiT test noise prediction
-uv run python scripts/dit/train_dit_full.py --mode test --checkpoint ./outputs/dit_8ch/checkpoint.pt
+# DiT training — 待重构（scripts/dit/train_dit_full.py 暂不可用）
+# uv run python scripts/dit/train_dit_full.py --epochs 50
 
 # Data preprocessing pipeline
 uv run python scripts/data_process/preprocess/preprocess_heightmaps.py --stage stats     # compute global percentiles
@@ -53,9 +49,9 @@ No linter, formatter, type checker, pre-commit hooks, or CI configured.
 The core idea: height and texture latents are concatenated channel-wise into an 8-channel joint latent, so the U-Net can model cross-modal correlations during denoising:
 
 ```
-torch.cat([height_latent, texture_latent], dim=1) → [B, 8, 64, 64]
-  channels 0-3: height latent (custom HeightMapVAE, 4×64×64)
-  channels 4-7: texture latent (SD VAE, 4×64×64, scaled by 0.18215)
+torch.cat([texture_latent, height_latent], dim=1) → [B, 8, 64, 64]
+  channels 0-3: texture latent (SD VAE, 4×64×64, scaled by 0.18215)
+  channels 4-7: height latent (custom HeightMapVAE, 4×64×64, scaling_factor=1.0)
 ```
 
 ### Component status
@@ -66,17 +62,18 @@ torch.cat([height_latent, texture_latent], dim=1) → [B, 8, 64, 64]
 | **DualBranchCLIPEncoder** | `models/clip/text_encoder.py` | Runnable (HF-based, frozen) |
 | **UNet8Channel** | `models/unet/unet_8ch.py` | Runnable |
 | **DiT8Channel** | `models/dit/dit_8ch.py` | Runnable (PixArt-alpha XL, drop-in UNet replacement) |
-| **UNetTrainingPipeline** | `train/train_pipeline.py` | Runnable (AMP, grad clipping, checkpoint, CSV logging, viz) |
+| **UNetTrainingPipeline** | `train/train_pipeline.py` | **搁置**（实际训练用 `scripts/unet/unet_full.py`） |
 | **InferencePipeline** | `inference/inference_pipeline.py` | Skeleton (all `NotImplementedError`) |
 | **DDIMScheduler** | `utils/latent_utils.py` | Skeleton (all `NotImplementedError`) |
-| **main.py** | `main.py` | Skeleton (all TODO) |
+| **main.py** | `main.py` | Skeleton（暂时弃用） |
 
 The VAE and U-Net training scripts under `scripts/` manipulate `sys.path` to import project modules — they do not use package entry points.
 
 ### Dual-branch CLIP text encoding
 
-- **Global branch**: CLIP `pooler_output` [B, 768] → linear projection → added to timestep embedding for global modulation of all ResNet blocks
-- **Local branch**: CLIP `last_hidden_state` [B, 77, 768] → linear projection → injected as `encoder_hidden_states` into cross-attention layers (spatially-aware conditioning)
+- **Global branch**: CLIP `pooler_output` [B, 768] → linear projection → added to timestep embedding for global modulation
+  - 注意：当前 SD UNet2DConditionModel 训练中 global_features 路径暂未启用，仅 DiT 和自定义 UNet8Channel 使用
+- **Local branch**: CLIP `last_hidden_state` [B, 77, 768] → injected as `encoder_hidden_states` into cross-attention layers (spatially-aware conditioning)
 
 ### HeightMapVAE details
 

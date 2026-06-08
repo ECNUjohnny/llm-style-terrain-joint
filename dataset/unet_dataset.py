@@ -165,8 +165,11 @@ class UNetDataset(Dataset):
                 dem_tensor = torch.rot90(dem_tensor, k, dims = [-2, -1])
 
         # 5. 最终映射到扩散模型所需的 [-1, 1] 区间
-        rgb_tensor = self.normalize(rgb_tensor) 
-        # dem_tensor = self.normalize(dem_tensor) 
+        rgb_tensor = self.normalize(rgb_tensor)
+        # 注意：DEM 保持 [0, 1]（未调用 self.normalize）。
+        # HeightMapVAE 在 [0,1] 数据上训练，直接输入即可。
+        # 当 dem_vae 不可用、回退到 SD VAE 编码时，需在编码前手动归一化到 [-1,1]。
+        # dem_tensor = self.normalize(dem_tensor)
 
         return {
             "rgb": rgb_tensor,
