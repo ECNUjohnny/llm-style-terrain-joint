@@ -54,7 +54,7 @@ from models.clip.text_encoder import build_text_encoder
 
 DATA_ROOT = "./data/unet_training"
 DEM_VAE_CKPT = "./data/vae_model_data/best_checkpoint.pt" 
-OUTPUT_DIR = "/root/autodl-fs/unet_outputs"
+OUTPUT_DIR = "./outputs/unet_8ch"
 
 EPOCHS = 50
 BATCH_SIZE = 4
@@ -62,13 +62,11 @@ LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 USE_AMP = True
-VAL_SPLIT = 0.05  # 验证集比例
+VAL_SPLIT = 0.05
 SEED = 65
-USE_CFGE = 0.1  # 使用无分类引导的概率
-GUIDANCE_SCALE = 4 # 1代表完全原始的输出
+USE_CFGE = 0.1
+GUIDANCE_SCALE = 4
 
-SAVE_STEPS = 12000
-LOG_STEPS = 10
 VIZ_INTERVAL = 1
 
 
@@ -108,7 +106,6 @@ def build_8ch_unet_from_sd(device="cuda"):
     )
     with torch.no_grad():
         new_conv_out.weight[:4, :, :, :] = old_conv_out.weight.clone()
-        # [核心修复 1] 换成 randn_like 正态分布，系数缩小至 0.01 避免正向偏移
         new_conv_out.weight[4:, :, :, :] = torch.randn_like(old_conv_out.weight) * 0.01
         new_conv_out.bias[:4] = old_conv_out.bias.clone()
         new_conv_out.bias[4:] = torch.zeros_like(old_conv_out.bias)
@@ -150,7 +147,6 @@ class UNetTrainer:
         self.viz_output_dir = self.output_dir / "visualizations"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.viz_output_dir.mkdir(parents=True, exist_ok=True)
-        self.dem_data = self.viz_output_dir / "dem_data.txt"
 
         # 加载对数归一化参数
         import json
@@ -177,8 +173,7 @@ class UNetTrainer:
             else:
                 core_params.append(param)
 
-        # 核心网络使用传入的保守学习率 (如 2e-5)
-        # 首尾卷积层使用 5 倍学习率 (如 1e-4) 加速 DEM 通道成型
+        # conv_in/conv_out 含新初始化的 DEM 通道，使用更高学习率
         self.optimizer = torch.optim.AdamW([
             {"params": core_params, "lr": args.learning_rate},
             {"params": conv_params, "lr": args.learning_rate * 5.0} 
@@ -219,9 +214,8 @@ class UNetTrainer:
         self.train_scheduler = DDPMScheduler(num_train_timesteps=1000)
         self.infer_scheduler = DDIMScheduler(num_train_timesteps=1000)
 
-        # 计算并保存 DEM 隐空间分布用于正态缩放
+        # 固定验证样本：取第一个 batch 的第一个样本
         val_batch = next(iter(self.val_dataloader))
-        # [核心修复 2]：去掉了 [0] 切片引发的单字母 Bug
         self.val_prompt = val_batch["prompt"][0]
         self.gt_name = val_batch["basename"][0] 
         self.val_rgb = val_batch["rgb"][:1].to(self.device)
@@ -296,50 +290,37 @@ class UNetTrainer:
                 # 计算 Min-SNR 权重：min(snr, gamma) / snr
                 min_snr_weight = torch.clamp(snr, max=gamma) / snr
 
-                # ==========================================================
-                # [修改] 2. 计算未求总均值的多任务 Loss
-                # ==========================================================
-                # reduction="none" 保证输出形状与输入一致，不急着求均值
+                # 逐通道计算噪声预测 MSE
                 loss_img_none = F.mse_loss(noise_pred[:, :4, :, :], noise[:, :4, :, :], reduction="none")
                 loss_dem_none = F.mse_loss(noise_pred[:, 4:, :, :], noise[:, 4:, :, :], reduction="none")
-                
-                # 把每张图的空间和通道维度(dim=1,2,3)拉平求均值，保留 batch 维度 (dim=0)
-                # 现在的尺寸是 [batch_size]
+
                 loss_img_batch = loss_img_none.mean(dim=[1, 2, 3])
                 loss_dem_batch = loss_dem_none.mean(dim=[1, 2, 3])
-                
-                
+
                 loss_batch = loss_img_batch + loss_dem_batch
-                
-                # ==========================================================
-                # [新增] 3. 应用权重并得出最终 Loss
-                # ==========================================================
-                # 将每张图的 loss 乘以它自己的 Min-SNR 权重，最后再对 batch 求均值
+
+                # 逐样本 Min-SNR 加权后取 batch 均值
                 loss = (loss_batch * min_snr_weight).mean()
                 
                 # 为了不影响下方进度条的打印，将独立 loss 也转为标量
                 loss_img = loss_img_batch.mean()
                 loss_dem = loss_dem_batch.mean()
 
+            self.optimizer.zero_grad()
+
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
-                # --- 新增：解缩放梯度并进行裁剪 ---
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.unet.parameters(), max_norm=1.0)
-                # ---------------------------------
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                # --- 新增：常规梯度裁剪 ---
                 torch.nn.utils.clip_grad_norm_(self.unet.parameters(), max_norm=1.0)
-                # ---------------------------------
                 self.optimizer.step()
-                
+
             self.lr_scheduler.step()
 
-            self.optimizer.zero_grad()
-            
             total_loss_epoch += loss.item()
             total_img_loss += loss_img.item()
             total_dem_loss += loss_dem.item()
@@ -366,10 +347,10 @@ class UNetTrainer:
         gt_rgb_np = (self.val_rgb[0] / 2 + 0.5).clamp(0, 1).cpu().permute(1, 2, 0).numpy()
         gt_dem_np = self.val_dem[0].clamp(0, 1).cpu()[0].numpy()
 
-        prompt = self.val_prompt 
-        guidance_scale = GUIDANCE_SCALE  # 标准 CFG 引导系数
-        
-        # --- 新增：分别获取无条件和有条件的特征 ---
+        prompt = self.val_prompt
+        guidance_scale = GUIDANCE_SCALE
+
+        # 无条件 + 有条件文本特征，拼接用于 CFG 推理
         _, uncond_local_features = self.text_encoder([""])
         _, cond_local_features = self.text_encoder([prompt])
         
@@ -378,21 +359,17 @@ class UNetTrainer:
 
         latents = torch.randn((1, 8, 64, 64), device=self.device)
         self.infer_scheduler.set_timesteps(50)
-        
+
         for t in tqdm(self.infer_scheduler.timesteps, desc="Sampling Image", leave=False):
-            # 将隐变量翻倍，以匹配 local_features 的 batch size
             latent_model_input = torch.cat([latents] * 2)
-            
-            # 由于部分 scheduler 需要缩放，DDIM 通常不需要，但保持规范
-            # latent_model_input = self.infer_scheduler.scale_model_input(latent_model_input, t)
-            
+
             output = self.unet(
                 sample=latent_model_input, 
                 timestep=t.unsqueeze(0).to(self.device), 
                 encoder_hidden_states=local_features
             )
             
-            # --- 新增：计算 CFG ---
+            # CFG 引导
             noise_pred_uncond, noise_pred_text = output.sample.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
             
@@ -408,7 +385,7 @@ class UNetTrainer:
         gen_rgb_np = rgb_image[0].permute(1, 2, 0).cpu().numpy()
         gen_dem_np = dem_image[0][0].cpu().numpy()
 
-        # [核心修复 4]：逆向对数还原为 16 位物理高差数据
+        # 对数逆归一化还原为物理高程 (uint16)
         p_low, min_log, max_log = self.norm_params["p_low"], self.norm_params["min_log"], self.norm_params["max_log"]
         h_real = np.exp(gen_dem_np * (max_log - min_log) + min_log) + p_low - 1
         dem_save_array = np.round(np.clip(h_real, 0, 65535)).astype(np.uint16)
@@ -456,7 +433,6 @@ class UNetTrainer:
         ax6.axis('off')
 
         ax7 = fig.add_subplot(2, 4, 7)
-        
         ax7.imshow(gt_dem_np, cmap='gray')
         ax7.set_title(f"[GT] {self.gt_name} DEM", color='blue', fontweight='bold')
         ax7.axis('off')
@@ -470,10 +446,8 @@ class UNetTrainer:
         fig.savefig(self.viz_output_dir / f"dashboard_epoch_{epoch:04d}.png", dpi=120)
         plt.close(fig)
 
-
-
     def train(self):
-        print(f"=== 开始训练 8 通道 U-Net ===")
+        print(f"=== 训练 8 通道 U-Net ===")
         print(f"Batch Size: {self.args.batch_size} | 目标 Epochs: {self.args.epochs}")
         
         for epoch in range(self.start_epoch, self.args.epochs):
@@ -583,16 +557,13 @@ class UNetTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.unet.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
-        # print()
-
         if "optimizer_state_dict" in checkpoint and self.args.mode == "train":
-            
+
             if getattr(self.args, "finetune", False):
 
-                print(f"\n[微调模式启动] 已成功加载第 {checkpoint['epoch']} 轮的基础权重！")
-                print(f"安全丢弃旧优化器和调度器。将使用全新的学习率 {self.args.learning_rate} 重新积累动量。")
-                self.start_epoch = 0 # 微调时 epoch 重新从 0 算起
-            
+                print(f"\n[微调模式] 已加载第 {checkpoint['epoch']} 轮权重，重置优化器和调度器。")
+                self.start_epoch = 0
+
             else:
                 
                 try:
@@ -600,11 +571,9 @@ class UNetTrainer:
                     if self.scaler and "scaler_state_dict" in checkpoint:
                         self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
                 except ValueError as e:
-                    print(f"\n[优化器警告] 检测到优化器参数组发生变化 (通常是因为修改了分层学习率)。")
-                    print(f"安全跳过加载旧的优化器状态，动量将重新积累，不会影响模型权重！")
-                    print(f"({e})\n")
+                    print(f"\n[警告] 优化器参数组发生变化，跳过旧状态加载: {e}")
 
-                # <-- 新增：恢复调度器状态
+                # 恢复 scheduler 状态
                 if "scheduler_state_dict" in checkpoint and hasattr(self, 'lr_scheduler'):
                     self.lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
@@ -614,8 +583,7 @@ class UNetTrainer:
                 self.loss_history = checkpoint.get("loss_history", [])
                 print(f"成功恢复训练状态！将从 Epoch {self.start_epoch} 继续。")
         else:
-            print(f"这是第{checkpoint['epoch']}轮的数据\n")
-            print("成功加载权重！")
+            print(f"已加载 epoch {checkpoint['epoch']} 的模型权重")
 
 
 def main():
@@ -716,7 +684,7 @@ def main():
     
     import torch.utils.data as data
     generator = torch.Generator().manual_seed(SEED)
-    # 因为 SEED 是固定的 42，每次运行脚本，切分出的索引列表是绝对一致的
+        # 固定 SEED 保证每次切分一致
     train_indices, val_indices = data.random_split(range(total_size), [train_size, val_size], generator=generator)
     
     print(f"数据总数: {total_size} | 训练集分配: {train_size} | 验证/测试集分配: {val_size}")
@@ -747,7 +715,7 @@ def main():
         if not args.checkpoint:
             raise ValueError("测试模式必须提供 --checkpoint 参数！")
         
-        # [核心修复] 测试集严格使用 validation 的切分索引，杜绝训练数据泄露
+        # 测试集使用 val 切分索引，避免训练数据泄露
         test_dataset = UNetDataset(data_root=args.data_root, augment=False, metadata_list=[full_metadata[i] for i in val_indices.indices])
         test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
         

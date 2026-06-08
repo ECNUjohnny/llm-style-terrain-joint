@@ -90,8 +90,7 @@ class UNetDataset(Dataset):
 
     def _load_rgb_to_tensor(self, rgb_path: str) -> torch.Tensor:
         """
-        【新增】兼容读取 .npy 和常见图像格式的彩色卫星图，
-        并统一转为 [3, 512, 512] 且值域在 [0, 1] 的 Tensor
+        读取 .npy 或常见图像格式，统一转为 [3, 512, 512]、值域 [0, 1] 的 Tensor
         """
         if rgb_path.endswith(".npy"):
             arr = np.load(rgb_path) # 之前你保存的应该是 [H, W, 3] 的 uint8 数组
@@ -142,7 +141,7 @@ class UNetDataset(Dataset):
             with open(entry["txt_path"], "r", encoding="utf-8") as f:
                 prompt = f.read().strip()
 
-        # 2. 读取 RGB 彩图并缩放 (使用新编写的兼容函数)
+        # 2. 读取 RGB 并缩放至目标尺寸
         rgb_tensor = self._load_rgb_to_tensor(entry["rgb_path"]) # [3, 512, 512], 值域 [0, 1]
 
         # 3. 读取 DEM 高程图并缩放
