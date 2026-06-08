@@ -22,7 +22,6 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 
-
 # =============================================================================
 # 历史默认超参数 (供独立重构参考)
 # =============================================================================
@@ -92,8 +91,10 @@ def setup_staged_optimizer(
 
         trainable = [p for p in model.parameters() if p.requires_grad]
         params_to_opt = [{"params": trainable, "lr": lr * 10}]
-        print(f"Stage 1: 训练 {len(trainable)}/"
-              f"{sum(1 for _ in model.parameters())} 个参数组（仅适配层）")
+        print(
+            f"Stage 1: 训练 {len(trainable)}/"
+            f"{sum(1 for _ in model.parameters())} 个参数组（仅适配层）"
+        )
     else:
         for param in model.parameters():
             param.requires_grad = True
@@ -110,8 +111,10 @@ def setup_staged_optimizer(
             {"params": pretrained_param_objs, "lr": lr},
             {"params": adapter_param_objs, "lr": lr * 10},
         ]
-        print(f"Stage 2: adapter {len(adapter_param_objs)} 组 @ {lr*10:.2e}, "
-              f"pretrained {len(pretrained_param_objs)} 组 @ {lr:.2e}")
+        print(
+            f"Stage 2: adapter {len(adapter_param_objs)} 组 @ {lr * 10:.2e}, "
+            f"pretrained {len(pretrained_param_objs)} 组 @ {lr:.2e}"
+        )
 
     return torch.optim.AdamW(params_to_opt, weight_decay=weight_decay)
 
