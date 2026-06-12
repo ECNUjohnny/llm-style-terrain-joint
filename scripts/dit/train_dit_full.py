@@ -248,10 +248,8 @@ class DiTTrainer:
                 )
                 v_pred = output.sample
 
-                # Loss: RGB + 1.5×DEM
-                loss_rgb = F.mse_loss(v_pred[:, :4], v_target[:, :4])
-                loss_dem = F.mse_loss(v_pred[:, 4:], v_target[:, 4:])
-                loss = loss_rgb + 1.5 * loss_dem
+                # Loss: RGB + 1.5×DEM (delegates to DiT.loss())
+                loss, loss_rgb, loss_dem = self.dit.loss(v_pred, v_target)
 
             self.optimizer.zero_grad()
 
