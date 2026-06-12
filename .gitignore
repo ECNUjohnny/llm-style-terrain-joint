@@ -26,3 +26,6 @@ docs/*_review.md
 
 # Plans
 docs/plans/*
+
+# Generated scripts
+scripts/download_*.py
