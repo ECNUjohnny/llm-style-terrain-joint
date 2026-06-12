@@ -3,8 +3,6 @@
 
 用法 / Usage:
     uv run python scripts/data_process/verify/scan_main.py [data_dir]
-
-    data_dir  默认为 data/main / defaults to data/main
 """
 
 import argparse
@@ -212,13 +210,13 @@ def scan_main(data_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="扫描 data/main 联合数据集并输出统计 / Scan joint dataset under data/main"
+        description="扫描 data/origin 联合数据集并输出统计 / Scan joint dataset under data/origin"
     )
     parser.add_argument(
         "data_dir",
         nargs="?",
-        default="data/main",
-        help="data/main 目录路径 / Path to the data/main directory",
+        default="data/origin/dit",
+        help="data/origin 目录路径 / Path to the data/origin directory",
     )
     args = parser.parse_args()
     scan_main(args.data_dir)
