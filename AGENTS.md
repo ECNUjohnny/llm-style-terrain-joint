@@ -19,7 +19,7 @@
 | HeightMapVAE test | `... --mode test --checkpoint <path>` | Runnable |
 | Data preprocess | `uv run python scripts/data_process/preprocess/preprocess_heightmaps.py --stage stats\|transform` | Runnable |
 | Data verify | `uv run python scripts/data_process/verify/scan_heightmaps.py` | Runnable |
-| DiT train | `scripts/dit/train_dit_full.py` | **Stalled** (needs refactor to UNetTrainer pattern) |
+| DiT train | `scripts/dit/train_dit_full.py --mode train --epochs 50` | Runnable |
 | `main.py` / `train/train_pipeline.py` / `inference/inference_pipeline.py` / `utils/latent_utils.py` | — | **Skeletons** (not importable) |
 
 ## Architecture essentials
