@@ -1,3 +1,3 @@
-from .dit_8ch import DiTBlock, DiT8Channel, build_dit
+from .dit import DiT, DiTBlock
 
-__all__ = ["DiTBlock", "DiT8Channel", "build_dit"]
+__all__ = ["DiT", "DiTBlock"]
