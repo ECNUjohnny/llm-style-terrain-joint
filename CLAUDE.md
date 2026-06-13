@@ -48,7 +48,7 @@ The height map provides geometric elevation data and the texture map provides su
 | HeightMapVAE | `models/vae/heightmap_vae.py` | Runnable (extend `AutoencoderKL`, 1-ch, latent [4,64,64]) |
 | DualBranchCLIPEncoder | `models/clip/text_encoder.py` | Runnable (HF CLIPTextModel, frozen) |
 | UNet8Channel | `models/unet/unet_8ch.py` | Runnable (diffusers 2D U-Net, 8-in/8-out) |
-| DiT8Channel | `models/dit/dit_8ch.py` | Runnable (PixArt-α XL port, ~934M, drop-in UNet replacement) |
+| DiT | `models/dit/dit.py` | Runnable (Facebook DiT, adaLN-Zero, ~439M, Flow Matching 从零训练) |
 | UNetTrainingPipeline | `train/train_pipeline.py` | **搁置**（实际训练用 `scripts/unet/unet_full.py`） |
 | HeightMapDataset, UNetDataset | `dataset/` | Runnable |
 | **InferencePipeline** | `inference/inference_pipeline.py` | Skeleton (`NotImplementedError`) |
@@ -76,8 +76,10 @@ uv run python scripts/unet/unet_full.py --mode train --epochs 50
 uv run python scripts/unet/unet_full.py --mode train --epochs 100 --checkpoint <path>   # resume
 uv run python scripts/unet/unet_full.py --mode test --checkpoint <path>
 
-# DiT training — 待重构（scripts/dit/train_dit_full.py 暂不可用）
-# uv run python scripts/dit/train_dit_full.py --epochs 50
+# DiT training (Facebook DiT, adaLN-Zero, Flow Matching, B=4, ~439M, 从零训练)
+uv run python scripts/dit/train_dit_full.py --mode train --epochs 50
+uv run python scripts/dit/train_dit_full.py --mode train --checkpoint <path>   # resume
+uv run python scripts/dit/train_dit_full.py --mode test --checkpoint <path>
 
 # Data preprocessing
 uv run python scripts/data_process/preprocess/preprocess_heightmaps.py --stage stats     # compute global percentiles
@@ -145,10 +147,12 @@ Sobel/Laplacian kernels are registered as non-persistent buffers.
 
 ## DiT-specific gotchas
 
-- **`time_embed_dim` must equal `hidden_size`** (1152), NOT `hidden_size * 4`. The 4x expansion made `adaLN_modulation` a 4608→10368 Linear per block (~48M x 28 = 1.3B params), bloating the model to ~1.96B.
-- **Pretrained loading uses `PixArtTransformer2DModel`** from diffusers. `nn.MultiheadAttention.in_proj_weight` requires concatenating PixArt's separate `to_q`/`to_k`/`to_v` weights.
-- **adaLN modulation and pos_embed are randomly initialized** — PixArt uses shared `adaln_single` while our DiTBlock uses per-block modulation, so these can't be loaded from pretrained.
-- **DiT staged training** (via `scripts/dit/train_dit_full.py` — 待重构): Stage 1 (burn-in, epochs 0-9) freezes backbone, trains only `global_text_proj` + `local_text_proj` at 10x lr. Stage 2 unfreezes all.
+- **Flow Matching** uses continuous timesteps t ∈ [0,1] (not discrete [0,999] DDPM steps). Velocity target `v = ε - x_0`, Dirac path `x_t = (1-t)·x_0 + t·ε`.
+- **adaLN-Zero init**: adaLN modulation final layer and output linear layer are zero-initialized. Each DiTBlock starts as identity mapping for stable from-scratch training.
+- **Dual-branch CLIP both active**: `pooler_output` [B,768] → adaLN conditioning; `last_hidden_state` [B,77,768] → cross-attention K/V. Both required for DiT forward.
+- **从零训练，无预训练权重** — 不需要 `load_pretrained()` 逻辑。使用单参数组 AdamW, lr=2e-4。
+- **Euler ODE 推理**: 50 steps, CFG guidance_scale=4.0, dt=1/50 per step. CFG batches [uncond, cond] for single forward pass.
+- **Loss**: `loss_rgb + 1.5*loss_dem`，与 UNet 基线一致。
 
 ## Conventions
 

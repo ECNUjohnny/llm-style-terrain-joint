@@ -27,8 +27,6 @@ import argparse
 import glob
 import json
 import os
-import re
-from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -123,9 +121,9 @@ def compute_global_stats(input_dir: str, sample_ratio: float = 1.0):
 def center_crop_resize(arr: np.ndarray) -> np.ndarray:
     """中心裁剪到 1080×1080 → Area 缩放 → 512×512 float32"""
     h, w = arr.shape
-    assert (
-        h == ORIGINAL_SIZE and w == ORIGINAL_SIZE
-    ), f"期望 {ORIGINAL_SIZE}×{ORIGINAL_SIZE}，实际 {h}×{w}"
+    assert h == ORIGINAL_SIZE and w == ORIGINAL_SIZE, (
+        f"期望 {ORIGINAL_SIZE}×{ORIGINAL_SIZE}，实际 {h}×{w}"
+    )
 
     # 中心裁剪
     margin = (ORIGINAL_SIZE - CROP_SIZE) // 2
